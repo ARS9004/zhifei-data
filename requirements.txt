@@ -5,3 +5,4 @@ pytz>=2023.3
 python-dotenv>=1.0.0
 python-docx>=0.8.11
 Pillow>=9.0.0
+pymysql>=1.1.0
