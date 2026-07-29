@@ -1,4 +1,4 @@
-# web.py —— 从OSS读取最近20轮对话并显示
+# web.py —— OSS 读取测试（显示调试信息 + 最近5轮）
 import streamlit as st
 import json
 import oss2
@@ -6,7 +6,7 @@ from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
 from datetime import datetime, timedelta
 
-# ===== 配置（写死） =====
+# ===== 配置 =====
 OSS_BUCKET = "zfai-date-oss"
 OSS_REGION = "cn-beijing"
 OSS_PREFIX = "chat_history/"
@@ -31,27 +31,23 @@ def get_oss_client():
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
-# ===== 获取当前周的文件名（如 2026-W30） =====
-def get_current_week_key():
-    now = datetime.now()
-    year, week, _ = now.isocalendar()
-    return f"{year}-W{week:02d}"
-
-# ===== 查找最近一个有数据的周文件（向前搜索最多5周） =====
+# ===== 查找最近一个有数据的周文件（向前搜索5周） =====
 def find_recent_week():
     bucket = get_oss_client()
     for i in range(5):
-        # 计算目标周的日期（从当前周往前推 i 周）
         now = datetime.now()
-        start_of_week = now - timedelta(days=now.weekday())  # 本周一
+        start_of_week = now - timedelta(days=now.weekday())
         target_date = start_of_week - timedelta(weeks=i)
         year, week, _ = target_date.isocalendar()
         week_key = f"{year}-W{week:02d}"
         remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
+        st.write(f"🔍 检查: {remote_path}")
         try:
             bucket.head_object(remote_path)
+            st.write(f"✅ 找到: {remote_path}")
             return week_key
-        except:
+        except Exception as e:
+            st.write(f"❌ 不存在: {remote_path} ({e})")
             continue
     return None
 
@@ -59,30 +55,27 @@ def find_recent_week():
 def read_oss_file(week_key):
     bucket = get_oss_client()
     remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
-    try:
-        result = bucket.get_object(remote_path)
-        content = result.read().decode("utf-8")
-        return json.loads(content)
-    except Exception as e:
-        st.error(f"读取失败: {e}")
-        return None
+    st.write(f"📂 读取: {remote_path}")
+    result = bucket.get_object(remote_path)
+    content = result.read().decode("utf-8")
+    return json.loads(content)
 
 # ===== 页面 =====
-st.set_page_config(page_title="智飞投研 · 最近对话", layout="centered")
-st.title("💬 最近20轮对话")
+st.set_page_config(page_title="智飞投研 · 最近对话(测试)", layout="centered")
+st.title("💬 最近5轮对话（测试版）")
 
 with st.spinner("加载中..."):
     week_key = find_recent_week()
     if week_key is None:
-        st.warning("未找到任何对话记录")
-        st.stop()
-    
-    messages = read_oss_file(week_key)
-    if not messages:
-        st.info("暂无对话")
+        st.error("❌ 未找到任何周文件（已检查最近5周）")
         st.stop()
 
-    # 按时间排序（有 timestamp 字段）
+    messages = read_oss_file(week_key)
+    if not messages:
+        st.info("📭 文件为空")
+        st.stop()
+
+    # 按时间排序
     def get_time(m):
         ts = m.get("timestamp") or m.get("time") or m.get("date")
         if isinstance(ts, str):
@@ -95,20 +88,16 @@ with st.spinner("加载中..."):
         return datetime.min
 
     messages_sorted = sorted(messages, key=get_time)
-    # 取最近40条（20轮）
-    recent = messages_sorted[-40:] if len(messages_sorted) >= 40 else messages_sorted
+    # 取最近10条（5轮）
+    recent = messages_sorted[-10:] if len(messages_sorted) >= 10 else messages_sorted
 
-st.caption(f"📅 来源：{week_key} ｜ 共 {len(recent)} 条消息")
+st.caption(f"📅 来源: {week_key} ｜ 共 {len(recent)} 条消息（最近5轮）")
 
 for msg in recent:
     role = msg.get("role", "")
     content = msg.get("content", "")
-    if role == "user":
-        with st.chat_message("user"):
-            st.markdown(content)
-    elif role == "assistant":
-        with st.chat_message("assistant"):
-            st.markdown(content)
+    with st.chat_message(role):
+        st.markdown(content)
 
 if st.button("🔄 刷新"):
     st.rerun()
