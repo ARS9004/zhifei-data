@@ -1,0 +1,13 @@
+streamlit>=1.53.0
+dashscope>=1.14.0
+tushare>=1.2.0
+pytz>=2023.3
+python-dotenv>=1.0.0
+python-docx>=0.8.11
+Pillow>=9.0.0
+PyMySQL==1.1.0
+SQLAlchemy==2.0.30
+pymysql>=1.1.0
+oss2
+aliyun-python-sdk-core
+aliyun-python-sdk-sts
