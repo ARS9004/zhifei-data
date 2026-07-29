@@ -1,16 +1,17 @@
-# web.py —— 只读 W30，取最近10轮（20条消息）
 import streamlit as st
 import json
 import oss2
+from datetime import datetime
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
-from datetime import datetime
 
 # ===== 配置 =====
 OSS_BUCKET = "zfai-date-oss"
 OSS_REGION = "cn-beijing"
 OSS_PREFIX = "chat_history/"
-WEEK_KEY = "2026-W30"  # 直接指定读 W30
+WEEK_KEY = "2026-W31"
+FILE_NAME = f"chat_history_{WEEK_KEY}.json"
+REMOTE_PATH = OSS_PREFIX + FILE_NAME
 
 # ===== 获取STS凭证 =====
 def get_sts_token():
@@ -32,55 +33,67 @@ def get_oss_client():
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
-# ===== 读取OSS文件 =====
-def read_oss_file(week_key):
+# ===== 读取OSS =====
+def read_oss():
     bucket = get_oss_client()
-    remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
     try:
-        result = bucket.get_object(remote_path)
-        content = result.read().decode("utf-8")
-        return json.loads(content)
-    except Exception as e:
-        st.error(f"读取失败: {e}")
-        return None
+        result = bucket.get_object(REMOTE_PATH)
+        return json.loads(result.read().decode("utf-8"))
+    except:
+        return []
+
+# ===== 写入OSS（覆盖） =====
+def write_oss(data):
+    bucket = get_oss_client()
+    local_temp = f"temp_{FILE_NAME}"
+    with open(local_temp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(local_temp, "rb") as f:
+        bucket.put_object(REMOTE_PATH, f)
+    import os
+    os.remove(local_temp)
 
 # ===== 页面 =====
-st.set_page_config(page_title="智飞投研 · 最近对话", layout="centered")
-st.title("💬 最近10轮对话")
+st.set_page_config(page_title="OSS 读写测试", layout="centered")
+st.title(f"📦 OSS 读写测试 - {WEEK_KEY}")
 
-with st.spinner("加载中..."):
-    messages = read_oss_file(WEEK_KEY)
-    if messages is None:
-        st.error(f"❌ 读取 {WEEK_KEY} 失败")
-        st.stop()
-    
-    if not messages:
-        st.info("📭 文件为空")
-        st.stop()
+# 读取数据
+with st.spinner("读取中..."):
+    messages = read_oss()
 
-    # 按时间排序
-    def get_time(m):
-        ts = m.get("timestamp") or m.get("time") or m.get("date")
-        if isinstance(ts, str):
-            try:
-                if 'T' in ts:
-                    return datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-            except:
-                return datetime.min
+if not messages:
+    st.warning("暂无数据")
+    st.stop()
+
+# 按时间排序取最近5轮（10条）
+def get_time(m):
+    ts = m.get("timestamp") or m.get("time") or m.get("date")
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except:
         return datetime.min
 
-    messages_sorted = sorted(messages, key=get_time)
-    # 取最近20条（10轮）
-    recent = messages_sorted[-20:] if len(messages_sorted) >= 20 else messages_sorted
+messages_sorted = sorted(messages, key=get_time)
+recent = messages_sorted[-10:] if len(messages_sorted) >= 10 else messages_sorted
 
-st.caption(f"📅 来源: {WEEK_KEY} ｜ 共 {len(recent)} 条消息（最近10轮）")
+st.caption(f"共 {len(messages)} 条消息，显示最近 {len(recent)} 条（5轮）")
 
 for msg in recent:
-    role = msg.get("role", "")
-    content = msg.get("content", "")
-    with st.chat_message(role):
-        st.markdown(content)
+    with st.chat_message(msg.get("role", "unknown")):
+        st.markdown(msg.get("content", ""))
 
-if st.button("🔄 刷新"):
+# ===== 输入框 =====
+user_input = st.chat_input("输入测试消息...")
+if user_input:
+    # 构造新消息
+    new_msg = {
+        "role": "user",
+        "content": user_input,
+        "timestamp": datetime.now().isoformat()
+    }
+    # 追加到列表
+    messages.append(new_msg)
+    # 写回OSS
+    write_oss(messages)
+    st.success("✅ 已写入 OSS")
     st.rerun()
