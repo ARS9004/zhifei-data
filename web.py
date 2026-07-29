@@ -78,28 +78,36 @@ st.title("📦 智飞投研 · 云端")
 week_key = get_current_week()
 if "history" not in st.session_state:
     st.session_state.history = read_oss(week_key) or []
-if "last_round" not in st.session_state:
-    st.session_state.last_round = None
 if "write_status" not in st.session_state:
     st.session_state.write_status = ""
 
-# 显示最新一轮
-if st.session_state.last_round:
-    for msg in st.session_state.last_round:
+# ===== 显示加载状态和最后一条消息 =====
+msg_count = len(st.session_state.history)
+round_count = msg_count // 2
+st.caption(f"已加载 {msg_count} 条消息（{round_count} 轮对话）")
+
+# 显示最新一轮对话（如果有）
+if msg_count >= 2:
+    last_two = st.session_state.history[-2:]
+    for msg in last_two:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+elif msg_count == 1:
+    # 只有一条消息（不完整的一轮）
+    with st.chat_message(st.session_state.history[0]["role"]):
+        st.markdown(st.session_state.history[0]["content"])
+else:
+    st.info("💬 开始新对话")
 
-# 输入
+# ===== 输入框 =====
 user_input = st.chat_input("输入消息...")
 if user_input:
-    # 新消息
     new_msg = {"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()}
     st.session_state.history.append(new_msg)
 
     # 取最近15轮（30条）作为上下文
     ctx = st.session_state.history[-30:] if len(st.session_state.history) > 30 else st.session_state.history
 
-    # 调模型
     with st.spinner("思考中..."):
         try:
             reply = call_bailian(ctx)
@@ -108,9 +116,7 @@ if user_input:
             st.stop()
         assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now().isoformat()}
         st.session_state.history.append(assistant_msg)
-        st.session_state.last_round = [new_msg, assistant_msg]
 
-        # 自动写OSS
         try:
             write_oss(week_key, st.session_state.history)
             st.session_state.write_status = "✅ 已保存到 OSS"
