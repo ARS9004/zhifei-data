@@ -1,20 +1,22 @@
+# web.py —— 智飞投研 · 云端轻量版（只读OSS + 写OSS + 调模型）
 import streamlit as st
 import json
 import oss2
 from datetime import datetime
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
+import dashscope
+from http import HTTPStatus
+import re
 
 # ===== 配置 =====
 OSS_BUCKET = "zfai-date-oss"
 OSS_REGION = "cn-beijing"
 OSS_PREFIX = "chat_history/"
-WEEK_KEY = "2026-W31"
-FILE_NAME = f"chat_history_{WEEK_KEY}.json"
-REMOTE_PATH = OSS_PREFIX + FILE_NAME
+MODEL_NAME = "qwen-plus"
 
-# ===== 获取STS凭证 =====
-def get_sts_token():
+# ===== 读取 OSS =====
+def get_oss_client():
     client = AcsClient(
         st.secrets["oss"]["access_key_id"],
         st.secrets["oss"]["access_key_secret"],
@@ -25,75 +27,112 @@ def get_sts_token():
     req.set_RoleSessionName("web-oss-session")
     req.set_DurationSeconds(900)
     resp = client.do_action_with_exception(req)
-    return json.loads(resp)["Credentials"]
-
-# ===== 获取OSS客户端 =====
-def get_oss_client():
-    creds = get_sts_token()
+    creds = json.loads(resp)["Credentials"]
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
-# ===== 读取OSS =====
-def read_oss():
+def read_oss(week_key):
     bucket = get_oss_client()
+    remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
     try:
-        result = bucket.get_object(REMOTE_PATH)
+        result = bucket.get_object(remote_path)
         return json.loads(result.read().decode("utf-8"))
     except:
         return []
 
-# ===== 写入OSS（覆盖） =====
-def write_oss(data):
+def write_oss(week_key, data):
     bucket = get_oss_client()
-    local_temp = f"temp_{FILE_NAME}"
+    remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
+    local_temp = f"temp_{week_key}.json"
     with open(local_temp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     with open(local_temp, "rb") as f:
-        bucket.put_object(REMOTE_PATH, f)
+        bucket.put_object(remote_path, f)
     import os
     os.remove(local_temp)
 
+def get_current_week():
+    now = datetime.now()
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+# ===== 调用百炼 =====
+def call_bailian(messages):
+    dashscope.api_key = st.secrets["dashscope"]["api_key"]
+    sys_p = f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    full_msgs = [{"role": "system", "content": sys_p}] + messages
+    resp = dashscope.Generation.call(
+        model=MODEL_NAME,
+        messages=full_msgs,
+        result_format="message",
+        stream=False
+    )
+    if resp.status_code == HTTPStatus.OK:
+        return resp.output.choices[0].message.content
+    raise Exception(f"API错误: {resp.code} - {resp.message}")
+
 # ===== 页面 =====
-st.set_page_config(page_title="OSS 读写测试", layout="centered")
-st.title(f"📦 OSS 读写测试 - {WEEK_KEY}")
+st.set_page_config(page_title="智飞投研", layout="centered")
+st.title("📦 智飞投研 · 云端")
 
-# 读取数据
-with st.spinner("读取中..."):
-    messages = read_oss()
+week_key = get_current_week()
+if "history" not in st.session_state:
+    st.session_state.history = read_oss(week_key) or []
+if "last_round" not in st.session_state:
+    st.session_state.last_round = None
+if "write_status" not in st.session_state:
+    st.session_state.write_status = ""
 
-if not messages:
-    st.warning("暂无数据")
-    st.stop()
+# 显示最新一轮
+if st.session_state.last_round:
+    for msg in st.session_state.last_round:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-# 按时间排序取最近5轮（10条）
-def get_time(m):
-    ts = m.get("timestamp") or m.get("time") or m.get("date")
-    try:
-        return datetime.fromisoformat(ts.replace('Z', '+00:00'))
-    except:
-        return datetime.min
-
-messages_sorted = sorted(messages, key=get_time)
-recent = messages_sorted[-10:] if len(messages_sorted) >= 10 else messages_sorted
-
-st.caption(f"共 {len(messages)} 条消息，显示最近 {len(recent)} 条（5轮）")
-
-for msg in recent:
-    with st.chat_message(msg.get("role", "unknown")):
-        st.markdown(msg.get("content", ""))
-
-# ===== 输入框 =====
-user_input = st.chat_input("输入测试消息...")
+# 输入
+user_input = st.chat_input("输入消息...")
 if user_input:
-    # 构造新消息
-    new_msg = {
-        "role": "user",
-        "content": user_input,
-        "timestamp": datetime.now().isoformat()
-    }
-    # 追加到列表
-    messages.append(new_msg)
-    # 写回OSS
-    write_oss(messages)
-    st.success("✅ 已写入 OSS")
+    # 新消息
+    new_msg = {"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()}
+    st.session_state.history.append(new_msg)
+
+    # 取最近15轮（30条）作为上下文
+    ctx = st.session_state.history[-30:] if len(st.session_state.history) > 30 else st.session_state.history
+
+    # 调模型
+    with st.spinner("思考中..."):
+        try:
+            reply = call_bailian(ctx)
+        except Exception as e:
+            st.error(f"模型调用失败: {e}")
+            st.stop()
+        assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now().isoformat()}
+        st.session_state.history.append(assistant_msg)
+        st.session_state.last_round = [new_msg, assistant_msg]
+
+        # 自动写OSS
+        try:
+            write_oss(week_key, st.session_state.history)
+            st.session_state.write_status = "✅ 已保存到 OSS"
+        except Exception as e:
+            st.session_state.write_status = f"⚠️ 写入失败: {e}"
+
     st.rerun()
+
+# ===== 底部按钮 =====
+col1, col2, col3 = st.columns([4, 1, 1])
+with col2:
+    if st.button("📥 一键写入"):
+        try:
+            write_oss(week_key, st.session_state.history)
+            st.session_state.write_status = "✅ 手动写入成功"
+        except Exception as e:
+            st.session_state.write_status = f"❌ 写入失败: {e}"
+        st.rerun()
+with col3:
+    if st.button("📤 导出TXT") and st.session_state.history:
+        txt = "\n\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.history[-20:]])
+        st.download_button("📥 下载", txt, file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M')}.txt", mime="text/plain", key="dl")
+
+if st.session_state.write_status:
+    st.caption(st.session_state.write_status)
