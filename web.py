@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v7.0（2026-07-31）
+智飞投研 · 云端轻量版 v7.1（2026-07-31）
 - 手机端专用：OSS 同步，摘要 + 3轮对话恢复
-- 双写：RDS + SQLite，每10轮同步 OSS
+- 双写：RDS + SQLite，每10轮同步 OSS，每20轮生成摘要
 - 无侧边栏、无历史会话、无编辑删除
 """
 
@@ -179,6 +179,71 @@ def sync_to_oss(messages):
         logger.info(f"✅ OSS 同步: {len(new_lines)} 条")
     return len(new_lines)
 
+# ================= 摘要生成 =================
+def generate_summary(messages_20_rounds: List[Dict]) -> str:
+    """调百炼生成摘要，格式：【核心任务】【关键决策】【技术问题】【待办事项】，不超过300字"""
+    dashscope.api_key = DASHSCOPE_API_KEY
+    dialogue = ""
+    for m in messages_20_rounds:
+        role = "用户" if m["role"] == "user" else "助手"
+        dialogue += f"{role}：{m.get('content', '')}\n"
+    prompt = f"""回顾以下对话，生成不超过300字的摘要，严格按格式输出：
+【核心任务】
+【关键决策】
+【技术问题】
+【待办事项】
+
+对话内容：
+{dialogue}"""
+    try:
+        resp = dashscope.Generation.call(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            result_format="message",
+            stream=False,
+        )
+        if resp.status_code == HTTPStatus.OK and resp.output.choices:
+            return resp.output.choices[0].message.content.strip()
+        else:
+            logger.error(f"摘要生成失败: {resp.code} - {resp.message}")
+            return ""
+    except Exception as e:
+        logger.error(f"摘要生成异常: {e}")
+        return ""
+
+def handle_summary_on_milestone(round_num: int, session_id: str):
+    """每20轮：生成摘要 → 写入 RDS chat_summary → 同步 OSS"""
+    msgs = st.session_state.messages
+    start = max(0, len(msgs) - 40)
+    recent_20 = msgs[start:]
+    summary = generate_summary(recent_20)
+    if not summary:
+        logger.warning("摘要生成为空，跳过")
+        return
+
+    round_range = f"{round_num - 19}-{round_num}"
+    try:
+        conn = get_rds_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO chat_summary (session_id, round_range, summary) VALUES (%s, %s, %s)",
+            (session_id, round_range, summary)
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"[摘要] RDS 写入成功: {round_range}")
+    except Exception as e:
+        logger.warning(f"[摘要] RDS 写入失败: {e}")
+
+    try:
+        bucket = get_oss_client()
+        remote = OSS_PREFIX + OSS_SUMMARY_FILE
+        data = {"summary": summary, "updated_at": datetime.now(BEIJING_TZ).isoformat()}
+        bucket.put_object(remote, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        logger.info(f"[摘要] OSS 写入成功")
+    except Exception as e:
+        logger.warning(f"[摘要] OSS 写入失败: {e}")
+
 # ================= 百炼优化：get_recent_messages 保持原版逻辑（按 round_num 排序） =================
 def get_recent_messages(limit=5):
     lines = read_oss()
@@ -187,7 +252,6 @@ def get_recent_messages(limit=5):
     valid_lines = [item for item in lines if isinstance(item, dict)]
     if not valid_lines:
         return []
-    # 保持原版排序：按 round_num（每个会话自己的轮数）
     sorted_lines = sorted(valid_lines, key=lambda x: x.get("round_num", 0), reverse=True)
     recent = sorted_lines[:limit]
     result = []
@@ -321,6 +385,8 @@ if "generating" not in st.session_state:
     st.session_state.generating = False
 if "stop" not in st.session_state:
     st.session_state.stop = False
+if "summary_done_rounds" not in st.session_state:
+    st.session_state.summary_done_rounds = set()
 
 # 显示状态
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
@@ -362,6 +428,10 @@ if user_input and not st.session_state.generating:
                 "messages": messages_dict,
                 "ts": user_msg["timestamp"]
             }])
+
+        if round_num % 20 == 0 and round_num not in st.session_state.summary_done_rounds:
+            handle_summary_on_milestone(round_num, session_id)
+            st.session_state.summary_done_rounds.add(round_num)
 
     except Exception as e:
         st.error(f"❌ 错误: {e}")
