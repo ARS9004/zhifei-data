@@ -179,14 +179,15 @@ def sync_to_oss(messages):
         logger.info(f"✅ OSS 同步: {len(new_lines)} 条")
     return len(new_lines)
 
+# ===== 改动1：get_recent_messages 排序从 round_num 改为 ts =====
 def get_recent_messages(limit=5):
-    """从 OSS 读取最近 N 轮对话，按时间戳排序"""
     lines = read_oss()
     if not lines:
         return []
     valid_lines = [item for item in lines if isinstance(item, dict)]
     if not valid_lines:
         return []
+    # 按 ts 降序取最近 N 条
     sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
     recent = sorted_lines[:limit]
     result = []
@@ -206,7 +207,7 @@ def get_recent_messages(limit=5):
             })
     return result
 
-
+# ===== 改动2：新增 get_summary() =====
 def get_summary() -> str:
     """从 OSS 读取 chat_summary.json 获取摘要"""
     try:
@@ -217,7 +218,6 @@ def get_summary() -> str:
         return data.get("summary", "")
     except:
         return ""
-
 
 # ================= SQLite 操作 =================
 def init_memory_db():
@@ -252,9 +252,8 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
     except Exception as e:
         logger.warning(f"SQLite 写入失败: {e}")
 
-# ================= 百炼调用 =================
+# ===== 改动3 + 改动4：call_bailian system prompt =====
 def call_bailian(messages: List[Dict]) -> str:
-    """调用百炼，注入摘要 + 历史上下文"""
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
