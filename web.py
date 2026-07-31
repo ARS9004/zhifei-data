@@ -65,7 +65,6 @@ OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
 OSS_FILENAME = "chat_history.jsonl"
-OSS_SUMMARY_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 
@@ -179,19 +178,19 @@ def sync_to_oss(messages):
         logger.info(f"✅ OSS 同步: {len(new_lines)} 条")
     return len(new_lines)
 
-# ===== 改动1：get_recent_messages 排序从 round_num 改为 ts =====
 def get_recent_messages(limit=5):
     lines = read_oss()
     if not lines:
         return []
+    # 过滤出 dict 类型
     valid_lines = [item for item in lines if isinstance(item, dict)]
     if not valid_lines:
         return []
-    # 按 ts 降序取最近 N 条
-    sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
+    sorted_lines = sorted(valid_lines, key=lambda x: x.get("round_num", 0), reverse=True)
     recent = sorted_lines[:limit]
     result = []
     for item in reversed(recent):
+        # 兼容两种格式：直接存了 messages 字典，或者 messages 是字符串
         msgs_data = item.get("messages", {})
         if isinstance(msgs_data, str):
             try:
@@ -206,18 +205,6 @@ def get_recent_messages(limit=5):
                 "round_num": item.get("round_num")
             })
     return result
-
-# ===== 改动2：新增 get_summary() =====
-def get_summary() -> str:
-    """从 OSS 读取 chat_summary.json 获取摘要"""
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_FILE
-        result = bucket.get_object(remote)
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("summary", "")
-    except:
-        return ""
 
 # ================= SQLite 操作 =================
 def init_memory_db():
@@ -252,38 +239,17 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
     except Exception as e:
         logger.warning(f"SQLite 写入失败: {e}")
 
-# ===== 改动3 + 改动4：call_bailian system prompt =====
+# ================= 百炼调用 =================
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
-
-    sys_parts = [
-        f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"
-    ]
-
-    summary = get_summary()
-    if summary:
-        sys_parts.append(f"\n【历史对话摘要】\n{summary}")
-
-    recent = get_recent_messages(limit=3)
-    if recent:
-        sys_parts.append("\n【最近对话（用于接续上文）】")
-        for m in recent:
-            role = "用户" if m["role"] == "user" else "助手"
-            content = m.get("content", "")[:300]
-            sys_parts.append(f"{role}：{content}")
-
-    sys_p = "\n".join(sys_parts)
+    sys_p = f"当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"
     full_msgs = [{"role": "system", "content": sys_p}] + messages
-
     retries, delay = 3, 2
     for attempt in range(retries):
         try:
-            resp = dashscope.Generation.call(
-                model=MODEL_NAME, messages=full_msgs,
-                result_format="message", stream=False
-            )
+            resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
             if resp.status_code == HTTPStatus.OK and resp.output.choices:
                 reset_health_status()
                 return resp.output.choices[0].message.content
