@@ -1,21 +1,31 @@
-# web.py —— 智飞投研 · 云端轻量版（只读OSS + 写OSS + 调模型）
-import streamlit as st
+# -*- coding: utf-8 -*-
+import os
 import json
-import oss2
+import time
+import io
 from datetime import datetime
+
+import streamlit as st
+import requests
+import oss2
+import pymysql
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
-import dashscope
-from http import HTTPStatus
-import re
 
-# ===== 配置 =====
+# ================= 配置 =================
 OSS_BUCKET = "zfai-date-oss"
 OSS_REGION = "cn-beijing"
 OSS_PREFIX = "chat_history/"
 MODEL_NAME = "qwen-plus"
+RENDER_ROUNDS = 3
+CONTEXT_ROUNDS = 5
+RDS_HOST = "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"
+RDS_PORT = 3306
+RDS_DATABASE = "stock_db"
+RDS_USER = "zhuanz1"
+RDS_PASSWORD = "zhuanz1_2026"
 
-# ===== 读取 OSS =====
+# ================= OSS 客户端 =================
 def get_oss_client():
     client = AcsClient(
         st.secrets["oss"]["access_key_id"],
@@ -31,114 +41,206 @@ def get_oss_client():
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
-def read_oss(week_key):
-    bucket = get_oss_client()
-    remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
+def get_week():
+    y, w, _ = datetime.now().isocalendar()
+    return f"{y}-W{w:02d}"
+
+def load_dialogues():
     try:
-        result = bucket.get_object(remote_path)
-        return json.loads(result.read().decode("utf-8"))
+        bucket = get_oss_client()
+        remote = f"{OSS_PREFIX}chat_history_{get_week()}.jsonl"
+        result = bucket.get_object(remote)
+        msgs = []
+        for line in result.read().decode('utf-8').strip().split('\n'):
+            if line.strip():
+                msgs.append(json.loads(line))
+        return msgs
     except:
         return []
 
-def write_oss(week_key, data):
+def save_dialogues(msgs):
     bucket = get_oss_client()
-    remote_path = OSS_PREFIX + f"chat_history_{week_key}.json"
-    local_temp = f"temp_{week_key}.json"
-    with open(local_temp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    with open(local_temp, "rb") as f:
-        bucket.put_object(remote_path, f)
-    import os
-    os.remove(local_temp)
+    remote = f"{OSS_PREFIX}chat_history_{get_week()}.jsonl"
+    content = "\n".join(json.dumps(m, ensure_ascii=False) for m in msgs) + "\n"
+    bucket.put_object(remote, content.encode('utf-8'))
 
-def get_current_week():
-    now = datetime.now()
-    year, week, _ = now.isocalendar()
-    return f"{year}-W{week:02d}"
+def load_summary():
+    try:
+        bucket = get_oss_client()
+        remote = f"{OSS_PREFIX}chat_history_{get_week()}.summary.json"
+        result = bucket.get_object(remote)
+        return json.loads(result.read().decode('utf-8')).get("summary", "")
+    except:
+        return ""
 
-# ===== 调用百炼 =====
-def call_bailian(messages):
-    dashscope.api_key = st.secrets["dashscope"]["api_key"]
+def save_summary(text):
+    bucket = get_oss_client()
+    remote = f"{OSS_PREFIX}chat_history_{get_week()}.summary.json"
+    bucket.put_object(remote, json.dumps({"summary": text}).encode('utf-8'))
+
+# ================= 调用百炼 =================
+def call_bailian(messages, stop_flag):
+    url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+    headers = {
+        "Authorization": f"Bearer {st.secrets['dashscope']['api_key']}",
+        "Content-Type": "application/json"
+    }
     sys_p = f"当前时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}"
     full_msgs = [{"role": "system", "content": sys_p}] + messages
-    resp = dashscope.Generation.call(
-        model=MODEL_NAME,
-        messages=full_msgs,
-        result_format="message",
-        stream=False
-    )
-    if resp.status_code == HTTPStatus.OK:
-        return resp.output.choices[0].message.content
-    raise Exception(f"API错误: {resp.code} - {resp.message}")
+    payload = {
+        "model": MODEL_NAME,
+        "input": {"messages": full_msgs},
+        "parameters": {"result_format": "message", "incremental_output": True}
+    }
+    with requests.post(url, headers=headers, json=payload, stream=True, timeout=120) as resp:
+        if resp.status_code != 200:
+            return f"❌ API错误: {resp.status_code}"
+        full = ""
+        buf = ""
+        for chunk in resp.iter_content(chunk_size=1024, decode_unicode=True):
+            if stop_flag():
+                return full + "\n\n⏹ 已停止"
+            if chunk:
+                buf += chunk
+                lines = buf.split('\n')
+                buf = lines[-1] if lines else ""
+                for line in lines[:-1]:
+                    if line.startswith('data:') and line[5:].strip() not in ['', '[DONE]']:
+                        try:
+                            data = json.loads(line[5:].strip())
+                            delta = data.get('output', {}).get('choices', [{}])[0].get('message', {}).get('content', '')
+                            if delta:
+                                full += delta
+                        except:
+                            pass
+        return full
 
-# ===== 页面 =====
-st.set_page_config(page_title="智飞投研", layout="centered")
-st.title("📦 智飞投研 · 云端")
+# ================= 导出TXT =================
+def export_txt(msgs):
+    out = ""
+    for m in msgs:
+        out += f"{'用户' if m['role']=='user' else '助手'}：{m.get('content','')}\n\n"
+    return out
 
-week_key = get_current_week()
-if "history" not in st.session_state:
-    st.session_state.history = read_oss(week_key) or []
-if "write_status" not in st.session_state:
-    st.session_state.write_status = ""
+def write_rds(msgs):
+    try:
+        conn = pymysql.connect(host=RDS_HOST, port=RDS_PORT, user=RDS_USER, password=RDS_PASSWORD, database=RDS_DATABASE, charset='utf8mb4')
+        for i, m in enumerate(msgs):
+            if m.get("role") == "user" and i+1 < len(msgs) and msgs[i+1].get("role") == "assistant":
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO chat_memory (user_msg, assistant_msg) VALUES (%s, %s)", (m.get("content"), msgs[i+1].get("content")))
+        conn.commit()
+        conn.close()
+        return True
+    except:
+        return False
 
-# ===== 显示加载状态和最后一条消息 =====
-msg_count = len(st.session_state.history)
-round_count = msg_count // 2
-st.caption(f"已加载 {msg_count} 条消息（{round_count} 轮对话）")
+# ================= 界面 =================
+st.set_page_config(page_title="智飞投研·云端", layout="centered")
 
-# 显示最新一轮对话（如果有）
-if msg_count >= 2:
-    last_two = st.session_state.history[-2:]
-    for msg in last_two:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-elif msg_count == 1:
-    # 只有一条消息（不完整的一轮）
-    with st.chat_message(st.session_state.history[0]["role"]):
-        st.markdown(st.session_state.history[0]["content"])
-else:
-    st.info("💬 开始新对话")
+st.title("📱 智飞投研")
 
-# ===== 输入框 =====
+# 加载数据
+if "msgs" not in st.session_state:
+    st.session_state.msgs = load_dialogues()
+if "summary" not in st.session_state:
+    st.session_state.summary = load_summary()
+if "generating" not in st.session_state:
+    st.session_state.generating = False
+if "stop" not in st.session_state:
+    st.session_state.stop = False
+
+# 状态提示
+total = len([m for m in st.session_state.msgs if m.get("role") == "user"])
+st.caption(f"{total}轮对话")
+
+# 渲染最近3轮
+for m in st.session_state.msgs[-RENDER_ROUNDS*2:]:
+    with st.chat_message(m["role"]):
+        st.markdown(m.get("content", ""))
+
+# ---- 输入 ----
 user_input = st.chat_input("输入消息...")
-if user_input:
-    new_msg = {"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()}
-    st.session_state.history.append(new_msg)
 
-    # 取最近15轮（30条）作为上下文
-    ctx = st.session_state.history[-30:] if len(st.session_state.history) > 30 else st.session_state.history
-
-    with st.spinner("思考中..."):
+if user_input and not st.session_state.generating:
+    st.session_state.stop = False
+    st.session_state.generating = True
+    
+    # 写入用户消息
+    st.session_state.msgs.append({"role": "user", "content": user_input, "timestamp": datetime.now().isoformat()})
+    save_dialogues(st.session_state.msgs)
+    
+    # 构建上下文：摘要 + 最近5轮
+    ctx = []
+    if st.session_state.summary:
+        ctx.append({"role": "system", "content": f"【历史摘要】{st.session_state.summary}"})
+    ctx.extend(st.session_state.msgs[-CONTEXT_ROUNDS*2:-1])
+    ctx.append({"role": "user", "content": user_input})
+    
+    # 调用模型
+    def stop_flag():
+        return st.session_state.stop
+    
+    reply = call_bailian(ctx, stop_flag)
+    
+    # 写入回复
+    st.session_state.msgs.append({"role": "assistant", "content": reply, "timestamp": datetime.now().isoformat()})
+    save_dialogues(st.session_state.msgs)
+    
+    # 简单摘要更新：每10轮更新一次
+    if total % 10 == 0 and total > 0:
         try:
-            reply = call_bailian(ctx)
-        except Exception as e:
-            st.error(f"模型调用失败: {e}")
-            st.stop()
-        assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now().isoformat()}
-        st.session_state.history.append(assistant_msg)
-
-        try:
-            write_oss(week_key, st.session_state.history)
-            st.session_state.write_status = "✅ 已保存到 OSS"
-        except Exception as e:
-            st.session_state.write_status = f"⚠️ 写入失败: {e}"
-
+            summary_prompt = f"将以下对话压缩成200字摘要：{json.dumps(st.session_state.msgs[-50:], ensure_ascii=False)[:4000]}"
+            summary = call_bailian([{"role": "user", "content": summary_prompt}], lambda: False)
+            if summary and "已停止" not in summary:
+                st.session_state.summary = summary
+                save_summary(summary)
+        except:
+            pass
+    
+    st.session_state.generating = False
     st.rerun()
 
-# ===== 底部按钮 =====
-col1, col2, col3 = st.columns([4, 1, 1])
-with col2:
-    if st.button("📥 一键写入"):
-        try:
-            write_oss(week_key, st.session_state.history)
-            st.session_state.write_status = "✅ 手动写入成功"
-        except Exception as e:
-            st.session_state.write_status = f"❌ 写入失败: {e}"
+# ---- 生成中的暂停 ----
+if st.session_state.generating:
+    with st.chat_message("assistant"):
+        st.markdown("⏳ 生成中...")
+    if st.button("⏹ 暂停", use_container_width=True):
+        st.session_state.stop = True
         st.rerun()
-with col3:
-    if st.button("📤 导出TXT") and st.session_state.history:
-        txt = "\n\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.history[-20:]])
-        st.download_button("📥 下载", txt, file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M')}.txt", mime="text/plain", key="dl")
 
-if st.session_state.write_status:
-    st.caption(st.session_state.write_status)
+# ---- 操作按钮 ----
+if not st.session_state.generating and st.session_state.msgs:
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if st.button("🔄 重新生成", use_container_width=True):
+            if st.session_state.msgs and st.session_state.msgs[-1]["role"] == "assistant":
+                st.session_state.msgs.pop()
+                st.session_state.generating = True
+                st.session_state.stop = False
+                st.rerun()
+    with col2:
+        if st.button("📤 导出TXT", use_container_width=True):
+            st.download_button("下载", export_txt(st.session_state.msgs), f"对话_{datetime.now().strftime('%Y%m%d')}.txt", "text/plain", key="dl")
+    with col3:
+        if st.button("💾 写入RDS", use_container_width=True):
+            if write_rds(st.session_state.msgs):
+                st.success("✅ RDS已写入")
+            else:
+                st.error("❌ RDS写入失败")
+    with col4:
+        if st.button("📤 上传文件", use_container_width=True):
+            st.info("⬇ 下方上传")
+
+# ---- 文件上传 ----
+with st.expander("📎 上传文件"):
+    f = st.file_uploader("选择文件", type=['txt','log','csv','md','py','json'], label_visibility="collapsed")
+    if f:
+        try:
+            content = f.read().decode('utf-8', errors='ignore')[:50000]
+            st.session_state.msgs.append({"role": "user", "content": f"【文件】{f.name}\n```\n{content}\n```"})
+            save_dialogues(st.session_state.msgs)
+            st.success(f"✅ {f.name} 已挂载")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ {e}")
