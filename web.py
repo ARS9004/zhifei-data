@@ -164,9 +164,11 @@ def write_oss(lines):
 
 def sync_to_oss(messages):
     existing = read_oss()
-    existing_ids = {(m.get("session_id"), m.get("round_num")) for m in existing}
+    existing_ids = {(m.get("session_id"), m.get("round_num")) for m in existing if isinstance(m, dict)}
     new_lines = []
     for m in messages:
+        if not isinstance(m, dict):
+            continue
         key = (m.get("session_id"), m.get("round_num"))
         if key not in existing_ids:
             new_lines.append(m)
@@ -180,12 +182,22 @@ def get_recent_messages(limit=5):
     lines = read_oss()
     if not lines:
         return []
-    sorted_lines = sorted(lines, key=lambda x: x.get("round_num", 0), reverse=True)
+    # 过滤出 dict 类型
+    valid_lines = [item for item in lines if isinstance(item, dict)]
+    if not valid_lines:
+        return []
+    sorted_lines = sorted(valid_lines, key=lambda x: x.get("round_num", 0), reverse=True)
     recent = sorted_lines[:limit]
     result = []
     for item in reversed(recent):
-        msgs = item.get("messages", {})
-        for msg in msgs.get("messages", []):
+        # 兼容两种格式：直接存了 messages 字典，或者 messages 是字符串
+        msgs_data = item.get("messages", {})
+        if isinstance(msgs_data, str):
+            try:
+                msgs_data = json.loads(msgs_data)
+            except:
+                msgs_data = {}
+        for msg in msgs_data.get("messages", []):
             result.append({
                 "role": msg.get("role"),
                 "content": msg.get("content"),
@@ -269,7 +281,7 @@ st.title("📱 智飞投研")
 init_memory_db()
 
 if "messages" not in st.session_state:
-    st.session_state.messages = get_recent_messages(limit=3)  # 最近3轮
+    st.session_state.messages = get_recent_messages(limit=3)
 if "session_id" not in st.session_state:
     st.session_state.session_id = get_or_create_session()
 if "generating" not in st.session_state:
@@ -282,7 +294,7 @@ total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"]
 st.caption(f"{total_rounds} 轮对话")
 
 # 渲染最近3轮
-for m in st.session_state.messages[-6:]:  # 最多6条消息 = 3轮
+for m in st.session_state.messages[-6:]:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content", ""))
 
@@ -296,11 +308,9 @@ if user_input and not st.session_state.generating:
     session_id = st.session_state.session_id
     round_num = len([m for m in st.session_state.messages if m["role"] == "user"]) + 1
 
-    # 写入用户消息
     user_msg = {"role": "user", "content": user_input, "timestamp": datetime.now(BEIJING_TZ).isoformat()}
     st.session_state.messages.append(user_msg)
 
-    # 构建上下文（最近所有消息）
     ctx = st.session_state.messages
 
     try:
@@ -308,14 +318,10 @@ if user_input and not st.session_state.generating:
         assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now(BEIJING_TZ).isoformat()}
         st.session_state.messages.append(assistant_msg)
 
-        # 写入 RDS
         messages_dict = {"messages": [user_msg, assistant_msg]}
         save_to_rds(session_id, round_num, messages_dict, user_msg["timestamp"])
-
-        # 写入 SQLite
         save_to_sqlite(session_id, round_num, messages_dict, user_msg["timestamp"])
 
-        # 每10轮同步 OSS
         if round_num % 10 == 0:
             sync_to_oss([{
                 "session_id": session_id,
