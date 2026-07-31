@@ -65,7 +65,6 @@ OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
 OSS_FILENAME = "chat_history.jsonl"
-OSS_SUMMARY_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 
@@ -211,7 +210,7 @@ def get_summary() -> str:
     """从 OSS 读取 chat_summary.json 获取摘要"""
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_FILE
+        remote = OSS_PREFIX + "chat_summary.json"
         result = bucket.get_object(remote)
         data = json.loads(result.read().decode('utf-8'))
         return data.get("summary", "")
@@ -254,13 +253,12 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
 
 # ================= 百炼调用 =================
 def call_bailian(messages: List[Dict]) -> str:
-    """调用百炼，注入摘要 + 历史上下文"""
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
 
     sys_parts = [
-        f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"
+        f"当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"
     ]
 
     summary = get_summary()
@@ -269,11 +267,10 @@ def call_bailian(messages: List[Dict]) -> str:
 
     recent = get_recent_messages(limit=3)
     if recent:
-        sys_parts.append("\n【最近对话（用于接续上文）】")
+        sys_parts.append("\n【最近对话】")
         for m in recent:
             role = "用户" if m["role"] == "user" else "助手"
-            content = m.get("content", "")[:300]
-            sys_parts.append(f"{role}：{content}")
+            sys_parts.append(f"{role}：{m.get('content', '')[:300]}")
 
     sys_p = "\n".join(sys_parts)
     full_msgs = [{"role": "system", "content": sys_p}] + messages
@@ -281,10 +278,7 @@ def call_bailian(messages: List[Dict]) -> str:
     retries, delay = 3, 2
     for attempt in range(retries):
         try:
-            resp = dashscope.Generation.call(
-                model=MODEL_NAME, messages=full_msgs,
-                result_format="message", stream=False
-            )
+            resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
             if resp.status_code == HTTPStatus.OK and resp.output.choices:
                 reset_health_status()
                 return resp.output.choices[0].message.content
