@@ -179,9 +179,8 @@ def sync_to_oss(messages):
         logger.info(f"✅ OSS 同步: {len(new_lines)} 条")
     return len(new_lines)
 
-# ===== 优化点1：get_recent_messages 按 ts 排序 =====
 def get_recent_messages(limit=5):
-    """从 OSS 读取最近 N 轮对话，按 ts 排序（而不是 round_num）"""
+    """从 OSS 读取最近 N 轮对话，按时间戳排序"""
     lines = read_oss()
     if not lines:
         return []
@@ -207,8 +206,9 @@ def get_recent_messages(limit=5):
             })
     return result
 
-# ===== 优化点2：新增 get_summary() 读取摘要 =====
+
 def get_summary() -> str:
+    """从 OSS 读取 chat_summary.json 获取摘要"""
     try:
         bucket = get_oss_client()
         remote = OSS_PREFIX + OSS_SUMMARY_FILE
@@ -217,6 +217,7 @@ def get_summary() -> str:
         return data.get("summary", "")
     except:
         return ""
+
 
 # ================= SQLite 操作 =================
 def init_memory_db():
@@ -251,8 +252,9 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
     except Exception as e:
         logger.warning(f"SQLite 写入失败: {e}")
 
-# ===== 优化点3 + 4：call_bailian 注入摘要 + 最近3轮对话 =====
+# ================= 百炼调用 =================
 def call_bailian(messages: List[Dict]) -> str:
+    """调用百炼，注入摘要 + 历史上下文"""
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
