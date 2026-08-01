@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v7.2（2026-08-01）
+智飞投研 · 云端轻量版 v7.3（2026-08-01）
 - 手机端专用：OSS 实时同步（每轮写），摘要 + 3轮对话恢复
-- 双写：RDS + SQLite + OSS（实时三写），每10轮额外校验
-- 无侧边栏、无历史会话、无编辑删除
-- ✅ 新增：熔断分级 & 摘要本地缓存
+- 双写：RDS + SQLite + OSS（实时三写）
+- ✅ 新增：百炼长期记忆（每次对话后自动写入）
 - ✅ 用户消息立即渲染，不等模型回复
+- ✅ 熔断分级 & 摘要本地缓存
 """
 
 import os
@@ -25,6 +25,7 @@ import dashscope
 import oss2
 import pymysql
 import pytz
+import requests
 from http import HTTPStatus
 from dotenv import load_dotenv
 from aliyunsdkcore.client import AcsClient
@@ -74,11 +75,23 @@ OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_k
 if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET:
     raise RuntimeError("⛔ 请配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
 
+# ================= 长期记忆配置 =================
+MEMORY_LIBRARY_ID = get_secret_or_env(
+    "MEMORY_LIBRARY_ID",
+    "memory.library_id",
+    "5e8360f1efbf4759a2a3d80d126fd77b"
+)
+MEMORY_USER_ID = get_secret_or_env(
+    "MEMORY_USER_ID",
+    "memory.user_id",
+    "zhifei_user"
+)
+
 # ================= 日志 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ================= 熔断（升级版：按错误类型分级） =================
+# ================= 熔断 =================
 _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
 _MODEL_HEALTHY = True
 _MAX_CONSECUTIVE_FAILURES = {"network": 5, "api": 3, "model": 2}
@@ -233,6 +246,44 @@ def get_summary() -> str:
         logger.warning(f"OSS 摘要读取失败，返回空摘要: {e}")
         return ""
 
+# ================= 百炼长期记忆 =================
+def write_to_memory(user_msg: str, assistant_msg: str, user_id: str = None) -> bool:
+    """
+    将本轮对话写入百炼长期记忆库
+    """
+    if not DASHSCOPE_API_KEY:
+        logger.warning("DASHSCOPE_API_KEY 未配置，跳过记忆写入")
+        return False
+
+    if user_id is None:
+        user_id = MEMORY_USER_ID
+
+    try:
+        url = "https://dashscope.aliyuncs.com/api/v2/apps/memory/add"
+        headers = {
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messages": [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": assistant_msg}
+            ],
+            "user_id": user_id,
+            "memory_library_id": MEMORY_LIBRARY_ID
+        }
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logger.info("✅ 长期记忆写入成功")
+            return True
+        else:
+            logger.warning(f"⚠️ 长期记忆写入失败: {resp.status_code} - {resp.text}")
+            return False
+    except Exception as e:
+        logger.warning(f"⚠️ 长期记忆写入异常: {e}")
+        return False
+
 # ================= SQLite 操作 =================
 def init_memory_db():
     try:
@@ -360,10 +411,9 @@ if user_input and not st.session_state.generating:
     }
     st.session_state.messages.append(user_msg)
 
-    # ===== 先 rerun 渲染用户消息 =====
     st.rerun()
 
-# ===== 如果有待处理的用户消息（最后一条是 user，且正在生成） =====
+# ===== 如果有待处理的用户消息 =====
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     session_id = st.session_state.session_id
     round_num = len([m for m in st.session_state.messages if m["role"] == "user"])
@@ -391,6 +441,9 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "messages": messages_dict,
             "ts": user_msg["timestamp"]
         }])
+
+        # ===== 写入百炼长期记忆 =====
+        write_to_memory(user_msg["content"], assistant_msg["content"], MEMORY_USER_ID)
 
     except Exception as e:
         st.error(f"❌ 错误: {e}")
