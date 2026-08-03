@@ -85,7 +85,6 @@
 	        try:
 	            meta = bucket.head_object(remote)
 	            length = meta.content_length
-	            # 读取尾部 40KB，确保能涵盖最近 10 轮对话
 	            read_size = min(length, 40960)
 	            start = length - read_size
 	            result = bucket.get_object(remote, byte_range=(start, length - 1))
@@ -145,7 +144,6 @@
 	    if not lines: return []
 	    valid_lines = [item for item in lines if isinstance(item, dict)]
 	    if not valid_lines: return []
-	    # 🚨 核心修改：按时间戳 ts 升序排成一条直线，取最后 10 轮
 	    sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=False)
 	    recent = sorted_lines[-limit:]
 	    result = []
@@ -163,11 +161,9 @@
 	            })
 	    return result
 	def init_session_on_startup():
-	    """网端 V1.1 核心：从 OSS 尾部强行接管最后一条数据的 session_id"""
 	    if "session_id" not in st.session_state:
 	        recent_msgs = get_recent_messages(limit=10)
 	        if recent_msgs:
-	            # 🚨 强行接管最后一条的 session_id，绝不再自动乱建
 	            st.session_state.session_id = recent_msgs[-1].get("session_id", str(uuid.uuid4()))
 	            st.session_state.messages = recent_msgs
 	        else:
@@ -202,7 +198,6 @@
 	    if not is_model_healthy(): raise RuntimeError("服务暂时不可用")
 	    dashscope.api_key = DASHSCOPE_API_KEY
 	    sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
-	    # 注入最近 10 轮对话（约 20 条消息）
 	    recent = st.session_state.get("messages", [])[-20:]
 	    if recent:
 	        sys_parts.append("\n【最近对话（用于接续上文）】")
