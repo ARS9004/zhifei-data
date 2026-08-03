@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
  
 """
-智飞投研 · 网端 1.0.1（2026-08-03）
-🚀 修正 OSS 文件名读取错误
-- ✅ 绝对遵循 7.2：OSS 文件名固定为 chat_history.jsonl，绝不分片不按周
-- ✅ 恢复根基：直接读 OSS 固定文件尾部
+智飞投研 · 网端 V1（2026-08-03）
+🚀 终极保底版：彻底解决失忆与恢复错位问题
+- ✅ 恢复根基：不依赖 RDS，不依赖指针，直接读 OSS 固定文件 chat_history.jsonl
+- ✅ 核心修复：按时间戳 ts 降序排序取最后 N 轮，解决新建会话后 round_num 重置导致的错乱
 - ✅ 写入优化：纯 O(1) 追加，失败降级全量写
+- ✅ 读取优化：O(1) 尾部 Range 读，失败降级全量读
 """
  
 import os
@@ -52,8 +53,7 @@ MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
-# 🚨 关键修正：回归 7.2 固定文件名，绝不乱改
-OSS_FILENAME = "chat_history.jsonl" 
+OSS_FILENAME = "chat_history.jsonl"  # 🚨 绝对固定，绝不乱改
 OSS_SUMMARY_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
@@ -97,17 +97,16 @@ def read_oss():
     """优化：优先 O(1) 尾部读取，失败降级 7.2 全量读取"""
     try:
         bucket = get_oss_client()
-        # 🚨 关键修正：使用 7.2 的固定路径
         remote = OSS_PREFIX + OSS_FILENAME
         try:
             meta = bucket.head_object(remote)
             length = meta.content_length
-            read_size = min(length, 20480)
+            read_size = min(length, 20480)  # 读尾部 20KB
             start = length - read_size
             result = bucket.get_object(remote, byte_range=(start, length - 1))
             content = result.read().decode('utf-8')
             if start > 0:
-                content = content[content.find('\n')+1:]
+                content = content[content.find('\n')+1:]  # 跳过截断的首行
             lines = [json.loads(line) for line in content.strip().split('\n') if line.strip()]
             if len(lines) < 6:
                 raise Exception("尾部数据不足，降级全量")
@@ -165,13 +164,15 @@ def sync_to_oss(lines):
  
 # ================= Session 恢复核心 =================
 def get_recent_messages(limit=3):
-    """7.2 逻辑：读固定文件 -> 排序 -> 取最后 N 轮"""
     lines = read_oss()
     if not lines: return []
     valid_lines = [item for item in lines if isinstance(item, dict)]
     if not valid_lines: return []
-    sorted_lines = sorted(valid_lines, key=lambda x: x.get("round_num", 0), reverse=True)
+    
+    # 🚨 关键修复：按时间戳 ts 降序排序，解决跨会话 round_num 重置导致的错乱
+    sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
     recent = sorted_lines[:limit]
+    
     result = []
     for item in reversed(recent):
         msgs_data = item.get("messages", {})
@@ -188,10 +189,11 @@ def get_recent_messages(limit=3):
     return result
  
 def init_session_on_startup():
-    """网端 1.0 核心：直接从 OSS 固定文件恢复，绝不依赖 RDS 和指针"""
+    """网端 V1 核心：直接从 OSS 固定文件恢复，按时间戳取最新"""
     if "session_id" not in st.session_state:
         recent_msgs = get_recent_messages(limit=3)
         if recent_msgs:
+            # 从最后一条提取 session_id，完美接管最新会话
             st.session_state.session_id = recent_msgs[-1].get("session_id", str(uuid.uuid4()))
             st.session_state.messages = recent_msgs
         else:
@@ -231,7 +233,7 @@ def call_bailian(messages: List[Dict]) -> str:
  
     sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
     
-    recent = st.session_state.get("messages", [])[-6:]
+    recent = st.session_state.get("messages", [])[-6:]  # 直接用内存里的最近 3 轮
     if recent:
         sys_parts.append("\n【最近对话（用于接续上文）】")
         for m in recent:
@@ -269,6 +271,7 @@ st.markdown("""<style>.stApp { background: #ffffff !important; }.stChatInputCont
 st.title("📱 智飞投研")
 init_memory_db()
  
+# 启动时恢复
 if "messages" not in st.session_state:
     init_session_on_startup()
 if "generating" not in st.session_state:
@@ -306,7 +309,7 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "session_id": session_id,
             "round_num": round_num,
             "messages": messages_dict,
-            "ts": user_msg["timestamp"]
+            "ts": user_msg["timestamp"]  # 🚨 确保 ts 字段被写入 OSS
         }])
     except Exception as e:
         st.error(f"❌ 错误: {e}")
