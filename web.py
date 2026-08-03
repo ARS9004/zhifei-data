@@ -1,13 +1,3 @@
-	#!/usr/bin/env python3
-	# -*- coding: utf-8 -*-
-	"""
-	智飞投研 · 网端 V1.1（2026-08-03）
-	🚀 全局时间线整合版
-	- ✅ 强制接管：死咬最后一条数据的 session_id，杜绝乱建会话
-	- ✅ 全局排序：把所有碎片化对话按 ts 严格排成一条时间线
-	- ✅ 上下文扩容：从只看最后 3 轮扩到最后 10 轮，接续更稳
-	- ✅ 写入/读取优化：保留 O(1) 尾部读与纯追加写
-	"""
 	import os
 	import re
 	import json
@@ -15,8 +5,8 @@
 	import uuid
 	import logging
 	import sqlite3
-	from datetime import datetime, time as dt_time
-	from typing import List, Dict, Tuple
+	from datetime import datetime
+	from typing import List, Dict
 	import streamlit as st
 	import dashscope
 	import oss2
@@ -26,7 +16,6 @@
 	from aliyunsdkcore.client import AcsClient
 	from aliyunsdksts.request.v20150401 import AssumeRoleRequest
 	load_dotenv()
-	# ================= 环境变量 =================
 	def get_secret_or_env(key, secrets_key=None, default=None):
 	    if secrets_key:
 	        parts = secrets_key.split('.')
@@ -38,7 +27,7 @@
 	        except: pass
 	    return os.getenv(key, default)
 	DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
-	if not DASHSCOPE_API_KEY: raise RuntimeError("⛔ 请配置 DASHSCOPE_API_KEY")
+	if not DASHSCOPE_API_KEY: raise RuntimeError("请配置 DASHSCOPE_API_KEY")
 	MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 	BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 	MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
@@ -51,7 +40,6 @@
 	OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 	logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 	logger = logging.getLogger(__name__)
-	# ================= 熔断机制 =================
 	_FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
 	_MODEL_HEALTHY = True
 	_MAX_CONSECUTIVE_FAILURES = {"network": 5, "api": 3, "model": 2}
@@ -77,7 +65,6 @@
 	    creds = json.loads(resp)["Credentials"]
 	    auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
 	    return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
-	# ================= OSS 读写优化 =================
 	def read_oss():
 	    try:
 	        bucket = get_oss_client()
@@ -93,10 +80,10 @@
 	                content = content[content.find('\n')+1:]
 	            lines = [json.loads(line) for line in content.strip().split('\n') if line.strip()]
 	            if len(lines) < 10:
-	                raise Exception("尾部数据不足，降级全量")
+	                raise Exception("降级全量")
 	            return lines
 	        except:
-	            logger.info("⚠️ 执行全量读取保底...")
+	            logger.info("执行全量读取保底...")
 	            result = bucket.get_object(remote)
 	            content = result.read().decode('utf-8')
 	            return [json.loads(line) for line in content.strip().split('\n') if line.strip()]
@@ -138,7 +125,6 @@
 	        new_lines = [m for m in lines if isinstance(m, dict) and (m.get("session_id"), m.get("round_num")) not in existing_ids]
 	        if new_lines:
 	            write_oss(existing + new_lines)
-	# ================= Session 恢复核心 =================
 	def get_recent_messages(limit=10):
 	    lines = read_oss()
 	    if not lines: return []
@@ -170,7 +156,6 @@
 	            st.session_state.session_id = str(uuid.uuid4())
 	            st.session_state.messages = []
 	    return st.session_state.messages
-	# ================= SQLite 兜底 =================
 	def init_memory_db():
 	    try:
 	        conn = sqlite3.connect(MEMORY_DB_PATH)
@@ -193,7 +178,6 @@
 	        conn.commit()
 	        conn.close()
 	    except: pass
-	# ================= 百炼调用 =================
 	def call_bailian(messages: List[Dict]) -> str:
 	    if not is_model_healthy(): raise RuntimeError("服务暂时不可用")
 	    dashscope.api_key = DASHSCOPE_API_KEY
@@ -225,7 +209,6 @@
 	    raise RuntimeError("未知错误")
 	def export_txt(messages):
 	    return "\n\n".join([f"{'用户' if m['role']=='user' else '助手'}：{m.get('content','')}" for m in messages])
-	# ================= UI =================
 	st.set_page_config(page_title="智飞投研·云端", layout="centered")
 	st.markdown("""<style>.stApp { background: #ffffff !important; }.stChatInputContainer { position: sticky !important; bottom: 0 !important; background: #ffffff !important; z-index: 999 !important; border-top: 1px solid #e5e7eb !important; }</style>""", unsafe_allow_html=True)
 	st.title("📱 智飞投研")
