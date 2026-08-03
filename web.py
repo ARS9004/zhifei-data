@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
  
 """
-智飞投研 · 网端 1.0（2026-08-03）
-🚀 终极保底版：彻底解决失忆问题
-- ✅ 恢复根基：不依赖 RDS，不依赖指针文件，直接读 OSS 当前周文件尾部
-- ✅ 写入优化：纯 O(1) 追加到周文件，失败降级全量写
-- ✅ 读取优化：O(1) 尾部 Range 读，失败降级全量读
-- ✅ Session 提取：直接从读到的尾部数据里拿 session_id，绝不丢链子
+智飞投研 · 网端 1.0.1（2026-08-03）
+🚀 修正 OSS 文件名读取错误
+- ✅ 绝对遵循 7.2：OSS 文件名固定为 chat_history.jsonl，绝不分片不按周
+- ✅ 恢复根基：直接读 OSS 固定文件尾部
+- ✅ 写入优化：纯 O(1) 追加，失败降级全量写
 """
  
 import os
@@ -53,6 +52,9 @@ MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
+# 🚨 关键修正：回归 7.2 固定文件名，绝不乱改
+OSS_FILENAME = "chat_history.jsonl" 
+OSS_SUMMARY_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
  
@@ -79,13 +81,6 @@ def mark_failure(error_type: str):
 def is_model_healthy() -> bool:
     return _MODEL_HEALTHY
  
-# ================= 工具函数 =================
-def get_week_key() -> str:
-    """获取当前周标识，如 2026-W31"""
-    now = datetime.now(BEIJING_TZ)
-    iso_calendar = now.isocalendar()
-    return f"{iso_calendar[0]}-W{iso_calendar[1]}"
- 
 def get_oss_client():
     client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
@@ -102,11 +97,12 @@ def read_oss():
     """优化：优先 O(1) 尾部读取，失败降级 7.2 全量读取"""
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + f"chat_history_{get_week_key()}.jsonl"
+        # 🚨 关键修正：使用 7.2 的固定路径
+        remote = OSS_PREFIX + OSS_FILENAME
         try:
             meta = bucket.head_object(remote)
             length = meta.content_length
-            read_size = min(length, 20480)  # 读尾部 20KB
+            read_size = min(length, 20480)
             start = length - read_size
             result = bucket.get_object(remote, byte_range=(start, length - 1))
             content = result.read().decode('utf-8')
@@ -128,7 +124,7 @@ def write_oss(lines):
     """7.2 原逻辑：全量覆盖写 (仅作降级保底)"""
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + f"chat_history_{get_week_key()}.jsonl"
+        remote = OSS_PREFIX + OSS_FILENAME
         content = "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n"
         bucket.put_object(remote, content.encode('utf-8'))
         return True
@@ -139,7 +135,7 @@ def sync_to_oss(lines):
     """优化：优先 O(1) 纯追加，失败降级全量去重写"""
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + f"chat_history_{get_week_key()}.jsonl"
+        remote = OSS_PREFIX + OSS_FILENAME
         
         if "oss_pos" not in st.session_state:
             meta = bucket.head_object(remote)
@@ -169,7 +165,7 @@ def sync_to_oss(lines):
  
 # ================= Session 恢复核心 =================
 def get_recent_messages(limit=3):
-    """7.2 逻辑：读周文件 -> 排序 -> 取最后 N 轮"""
+    """7.2 逻辑：读固定文件 -> 排序 -> 取最后 N 轮"""
     lines = read_oss()
     if not lines: return []
     valid_lines = [item for item in lines if isinstance(item, dict)]
@@ -192,11 +188,10 @@ def get_recent_messages(limit=3):
     return result
  
 def init_session_on_startup():
-    """网端 1.0 核心：直接从 OSS 周文件恢复，绝不依赖 RDS 和指针"""
+    """网端 1.0 核心：直接从 OSS 固定文件恢复，绝不依赖 RDS 和指针"""
     if "session_id" not in st.session_state:
         recent_msgs = get_recent_messages(limit=3)
         if recent_msgs:
-            # 从最后一条提取 session_id，完美接管旧会话
             st.session_state.session_id = recent_msgs[-1].get("session_id", str(uuid.uuid4()))
             st.session_state.messages = recent_msgs
         else:
@@ -236,8 +231,7 @@ def call_bailian(messages: List[Dict]) -> str:
  
     sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
     
-    # 注入最近对话
-    recent = st.session_state.get("messages", [])[-6:]  # 直接用内存里的最近 3 轮
+    recent = st.session_state.get("messages", [])[-6:]
     if recent:
         sys_parts.append("\n【最近对话（用于接续上文）】")
         for m in recent:
@@ -275,7 +269,6 @@ st.markdown("""<style>.stApp { background: #ffffff !important; }.stChatInputCont
 st.title("📱 智飞投研")
 init_memory_db()
  
-# 启动时恢复
 if "messages" not in st.session_state:
     init_session_on_startup()
 if "generating" not in st.session_state:
