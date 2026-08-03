@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+ 
 """
-智飞投研 · 云端纯OSS版 v9.0（2026-08-03）
+智飞投研 · 云端纯OSS版 v9.11（2026-08-03）
 - 手机端专用：彻底剔除 RDS 依赖，纯 OSS 交互
-- ✅ P0 修复：后加载改为尾部读取防 OOM 崩溃
-- ✅ P0 修复：触发后加载后立即写入占位记录，防刷新死循环
-- ✅ P1 修复：缓存 OSS 追加偏移量(oss_append_pos)，避免每轮 head 探测
-- ✅ P1 修复：inject_memory 兜底逻辑增强
+- ✅ P0 修复：过滤空占位记录，解决网端始终显示0轮对话的致命Bug
+- ✅ P1 修复：_ensure_appendable 改为流式分块迁移，防大文件 OOM
+- ✅ P1 修复：load_recent_from_oss 增强过滤逻辑，防尾部全是占位记录时回退失效
+- ✅ P2 修复：trigger_backup_and_restore 动态扩大读取范围，防大对话遗漏
+- ✅ P1 修复：缓存 OSS 追加偏移量，避免每轮 head 探测
 - ✅ P2 修复：摘要窗口写入采用 If-Match 乐观锁，防多端并发覆盖
 """
-
+ 
 import os
 import re
 import json
@@ -20,7 +21,7 @@ import logging
 import sqlite3
 from datetime import datetime, time as dt_time
 from typing import List, Dict, Any, Tuple
-
+ 
 import streamlit as st
 import dashscope
 import pytz
@@ -29,9 +30,9 @@ from http import HTTPStatus
 from dotenv import load_dotenv
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
-
+ 
 load_dotenv()
-
+ 
 # ================= 环境变量 =================
 def get_secret_or_env(key, secrets_key=None, default=None):
     if secrets_key:
@@ -43,63 +44,63 @@ def get_secret_or_env(key, secrets_key=None, default=None):
             if value: return value
         except: pass
     return os.getenv(key, default)
-
+ 
 DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY: raise RuntimeError("⛔ 请配置 DASHSCOPE_API_KEY")
-
+ 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
-
+ 
 # ================= OSS 配置 =================
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
 OSS_FILENAME = get_secret_or_env("OSS_FILENAME", "oss.filename", "chat_history.jsonl")
 OSS_SUMMARY_FILE = "chat_summary_window.json"
-
+ 
 # ================= 后加载与渲染配置 =================
 SESSION_WINDOW_SIZE = 12
 RECOVER_ROUNDS = 3
 RENDER_ROUNDS = 5
 SESSION_GAP_SECONDS = 3600
-
+ 
 # ================= 统一时间格式 =================
 TS_FORMAT = '%Y-%m-%d %H:%M:%S'
-
+ 
 def now_ts() -> str:
     return datetime.now(BEIJING_TZ).strftime(TS_FORMAT)
-
+ 
 # ================= 日志 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
+ 
 # ================= 熔断 =================
 _FAIL_COUNTER = 0
 _MODEL_HEALTHY = True
 MAX_CONSECUTIVE_FAILURES = 3
-
+ 
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     _FAIL_COUNTER = 0
     _MODEL_HEALTHY = True
-
+ 
 def mark_failure():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     _FAIL_COUNTER += 1
     if _FAIL_COUNTER >= MAX_CONSECUTIVE_FAILURES:
         _MODEL_HEALTHY = False
         logger.warning("🚨 模型服务熔断已触发，连续失败 %d 次", _FAIL_COUNTER)
-
+ 
 def is_model_healthy() -> bool:
     return _MODEL_HEALTHY
-
+ 
 # ================= 辅助函数 =================
 def estimate_tokens(text: str) -> int:
     if not text: return 0
     ch = len(re.findall(r'[\u4e00-\u9fff]', text))
     return int(ch / 1.5 + (len(text) - ch) / 4)
-
+ 
 # ================= OSS 操作 =================
 def get_oss_client():
     access_key_id = os.getenv("OSS_ACCESS_KEY_ID")
@@ -114,8 +115,9 @@ def get_oss_client():
     creds = json.loads(resp)["Credentials"]
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
-
+ 
 def _ensure_appendable(bucket, remote_path: str) -> int:
+    """v9.11 修复：改用流式分块迁移，防大文件 OOM"""
     tmp_path = remote_path + ".tmp_append"
     try:
         head = bucket.head_object(remote_path)
@@ -124,53 +126,62 @@ def _ensure_appendable(bucket, remote_path: str) -> int:
             bucket.append_object(remote_path, pos, b'')
             return pos
         except oss2.exceptions.ObjectNotAppendable:
-            logger.info("🔄 检测到 Normal 类型 OSS 文件，开始安全迁移...")
+            logger.info("🔄 检测到 Normal 类型 OSS 文件，开始流式安全迁移...")
             try:
-                use_tmp = False
-                try:
-                    tmp_head = bucket.head_object(tmp_path)
-                    if tmp_head.content_length > 0 and tmp_head.content_length >= pos:
-                        use_tmp = True
-                except oss2.exceptions.NoSuchKey:
-                    pass
+                # 先清理可能存在的残留临时文件
+                try: bucket.delete_object(tmp_path)
+                except: pass
                 
-                if use_tmp:
-                    old_content = bucket.get_object(tmp_path).read()
-                else:
-                    old_content = bucket.get_object(remote_path).read()
-                    try: bucket.delete_object(tmp_path)
-                    except: pass
-                    bucket.append_object(tmp_path, 0, old_content)
+                # 流式分块拷贝到临时文件
+                stream = bucket.get_object(remote_path)
+                curr_pos = 0
+                while True:
+                    chunk = stream.read(64 * 1024)  # 64KB 分块
+                    if not chunk: break
+                    bucket.append_object(tmp_path, curr_pos, chunk)
+                    curr_pos += len(chunk)
                 
+                # 流式分块拷贝回原文件
                 bucket.delete_object(remote_path)
-                bucket.append_object(remote_path, 0, old_content)
+                stream = bucket.get_object(tmp_path)
+                curr_pos = 0
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk: break
+                    bucket.append_object(remote_path, curr_pos, chunk)
+                    curr_pos += len(chunk)
+                    
                 bucket.delete_object(tmp_path)
-                return len(old_content)
+                return curr_pos
             except Exception as e:
-                logger.error(f"OSS 文件安全迁移失败: {e}")
+                logger.error(f"OSS 文件流式迁移失败: {e}")
                 raise
     except oss2.exceptions.NoSuchKey:
         try:
             tmp_head = bucket.head_object(tmp_path)
             if tmp_head.content_length > 0:
-                logger.warning("⚠️ 检测到残留临时文件，正在恢复...")
-                old_content = bucket.get_object(tmp_path).read()
-                bucket.append_object(remote_path, 0, old_content)
+                logger.warning("⚠️ 检测到残留临时文件，正在流式恢复...")
+                stream = bucket.get_object(tmp_path)
+                curr_pos = 0
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk: break
+                    bucket.append_object(remote_path, curr_pos, chunk)
+                    curr_pos += len(chunk)
                 bucket.delete_object(tmp_path)
-                return len(old_content)
+                return curr_pos
         except oss2.exceptions.NoSuchKey:
             pass
         return 0
     except Exception as e:
         logger.error(f"检查 Appendable 失败: {e}")
         raise
-
+ 
 def save_to_oss_directly(session_id: str, round_num: int, round_messages: dict, ts: str):
     try:
         bucket = get_oss_client()
         remote_path = OSS_PREFIX + OSS_FILENAME
         
-        # v9.0 P1 修复：缓存 pos 避免 head 探测
         if "oss_append_pos" not in st.session_state:
             st.session_state.oss_append_pos = _ensure_appendable(bucket, remote_path)
         
@@ -184,8 +195,8 @@ def save_to_oss_directly(session_id: str, round_num: int, round_messages: dict, 
     except Exception as e:
         logger.warning(f"网端直接写入 OSS 失败: {e}")
         if "oss_append_pos" in st.session_state:
-            del st.session_state.oss_append_pos  # 失败重置
-
+            del st.session_state.oss_append_pos
+ 
 def load_recent_from_oss(limit: int = 3) -> List[Dict]:
     try:
         bucket = get_oss_client()
@@ -195,7 +206,7 @@ def load_recent_from_oss(limit: int = 3) -> List[Dict]:
             file_size = head.content_length
             if file_size == 0: return []
             
-            tail_size = min(50 * 1024, file_size)
+            tail_size = min(100 * 1024, file_size)
             resp = bucket.get_object(remote_path, byte_range=(file_size - tail_size, file_size - 1))
             content = resp.read().decode('utf-8')
             
@@ -215,7 +226,23 @@ def load_recent_from_oss(limit: int = 3) -> List[Dict]:
                 except:
                     continue
             
-            valid_lines = [item for item in lines if isinstance(item, dict)]
+            # v9.11 P1 修复：过滤掉空占位记录，不单纯依赖 round_num
+            valid_lines = []
+            for item in lines:
+                if not isinstance(item, dict): continue
+                msgs_data = item.get("messages", {})
+                if isinstance(msgs_data, str):
+                    try: msgs_data = json.loads(msgs_data)
+                    except: msgs_data = {}
+                actual_msgs = []
+                if isinstance(msgs_data, dict):
+                    actual_msgs = msgs_data.get("messages", [])
+                elif isinstance(msgs_data, list):
+                    actual_msgs = msgs_data
+                
+                if actual_msgs:  # 只要消息列表非空就保留，解决尾部全是占位记录回退失效问题
+                    valid_lines.append(item)
+                    
             sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
             recent = sorted_lines[:limit]
             
@@ -225,7 +252,12 @@ def load_recent_from_oss(limit: int = 3) -> List[Dict]:
                 if isinstance(msgs_data, str):
                     try: msgs_data = json.loads(msgs_data)
                     except: msgs_data = {}
-                actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
+                actual_msgs = []
+                if isinstance(msgs_data, dict):
+                    actual_msgs = msgs_data.get("messages", [])
+                elif isinstance(msgs_data, list):
+                    actual_msgs = msgs_data
+                    
                 for msg in actual_msgs:
                     msgs.append({"role": msg.get("role"), "content": msg.get("content"), "timestamp": item.get("ts"), "session_id": item.get("session_id")})
             return msgs
@@ -233,7 +265,7 @@ def load_recent_from_oss(limit: int = 3) -> List[Dict]:
             return []
     except:
         return []
-
+ 
 # ================= OSS 滑动窗口与累积摘要 =================
 def _read_summary_window(bucket) -> dict:
     remote_path = OSS_PREFIX + OSS_SUMMARY_FILE
@@ -248,9 +280,8 @@ def _read_summary_window(bucket) -> dict:
     except Exception as e:
         logger.warning(f"读取摘要窗口失败: {e}")
         return {"window": [], "cumulative": ""}
-
+ 
 def _save_summary_window(bucket, window: List[Dict], cumulative: str):
-    # v9.0 P2 修复：使用 If-Match 乐观锁防并发覆盖
     remote_path = OSS_PREFIX + OSS_SUMMARY_FILE
     data = {"window": window, "cumulative": cumulative}
     try:
@@ -262,7 +293,7 @@ def _save_summary_window(bucket, window: List[Dict], cumulative: str):
             bucket.put_object(remote_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
     except Exception as e:
         logger.warning(f"保存摘要窗口失败(可能并发冲突): {e}")
-
+ 
 def generate_summary(messages: List[Dict]) -> str:
     if not messages: return ""
     try:
@@ -272,7 +303,7 @@ def generate_summary(messages: List[Dict]) -> str:
     except Exception as e:
         logger.warning(f"摘要生成失败: {e}")
     return ""
-
+ 
 def _generate_new_cumulative(previous_cumulative: str, new_summary: str) -> str:
     if not previous_cumulative: return new_summary
     combined = f"{previous_cumulative}\n\n---\n\n{new_summary}"
@@ -285,21 +316,37 @@ def _generate_new_cumulative(previous_cumulative: str, new_summary: str) -> str:
     except Exception as e:
         logger.warning(f"累积摘要生成失败: {e}")
     return previous_cumulative
-
+ 
 def trigger_backup_and_restore(old_session_id: str):
     logger.info(f"🔄 开始网端后加载: {old_session_id}")
     try:
         bucket = get_oss_client()
         remote_path = OSS_PREFIX + OSS_FILENAME
         
-        # v9.0 P0 修复：改用尾部读取防 OOM
         try:
             head = bucket.head_object(remote_path)
             file_size = head.content_length
             if file_size == 0: return
-            tail_size = min(200 * 1024, file_size)  # 读最后 200KB
-            resp = bucket.get_object(remote_path, byte_range=(file_size - tail_size, file_size - 1))
-            content = resp.read().decode('utf-8')
+            
+            # v9.11 P2 修复：动态扩大读取范围，防大对话遗漏
+            tail_size = min(200 * 1024, file_size)
+            content = ""
+            while True:
+                resp = bucket.get_object(remote_path, byte_range=(file_size - tail_size, file_size - 1))
+                content = resp.read().decode('utf-8')
+                valid_count = 0
+                for line in content.strip().split('\n'):
+                    if not line.strip(): continue
+                    try:
+                        row = json.loads(line)
+                        if row.get("session_id") == old_session_id and row.get("round_num", 0) > 0:
+                            valid_count += 1
+                    except: continue
+                
+                if valid_count >= RECOVER_ROUNDS or tail_size >= file_size:
+                    break
+                tail_size = min(tail_size * 2, file_size)
+                
         except oss2.exceptions.NoSuchKey:
             return
             
@@ -309,11 +356,18 @@ def trigger_backup_and_restore(old_session_id: str):
             if not line.strip(): continue
             try:
                 row = json.loads(line)
-                if row.get("session_id") == old_session_id:
+                if row.get("session_id") == old_session_id and row.get("round_num", 0) > 0:
                     old_rows.append(row)
                     msgs_data = row.get("messages", {})
                     if isinstance(msgs_data, str): msgs_data = json.loads(msgs_data)
-                    for msg in msgs_data.get("messages", []):
+                    
+                    actual_msgs = []
+                    if isinstance(msgs_data, dict):
+                        actual_msgs = msgs_data.get("messages", [])
+                    elif isinstance(msgs_data, list):
+                        actual_msgs = msgs_data
+                        
+                    for msg in actual_msgs:
                         old_messages.append(msg)
             except: continue
             
@@ -343,7 +397,14 @@ def trigger_backup_and_restore(old_session_id: str):
         for row in old_rows[-RECOVER_ROUNDS:]:
             msgs_data = row.get("messages", {})
             if isinstance(msgs_data, str): msgs_data = json.loads(msgs_data)
-            recent_rounds.append({"round_messages": msgs_data.get("messages", []), "timestamp": row.get("ts", "")})
+            
+            actual_msgs = []
+            if isinstance(msgs_data, dict):
+                actual_msgs = msgs_data.get("messages", [])
+            elif isinstance(msgs_data, list):
+                actual_msgs = msgs_data
+                
+            recent_rounds.append({"round_messages": actual_msgs, "timestamp": row.get("ts", "")})
             
         st.session_state._recovery_context = {
             "summary": new_cumulative,
@@ -352,7 +413,7 @@ def trigger_backup_and_restore(old_session_id: str):
         }
     except Exception as e:
         logger.error(f"❌ 网端后加载失败: {e}")
-
+ 
 # ================= 网端上下文恢复 =================
 def get_or_create_session() -> str:
     if "session_id" not in st.session_state:
@@ -367,7 +428,6 @@ def get_or_create_session() -> str:
                 if (now - last_dt).total_seconds() >= SESSION_GAP_SECONDS:
                     st.session_state.session_id = str(uuid.uuid4())
                     trigger_backup_and_restore(last_session_id)
-                    # v9.0 P0 修复：立即写占位记录防刷新死循环
                     save_to_oss_directly(st.session_state.session_id, 0, {"messages": []}, now_ts())
                 else:
                     st.session_state.session_id = last_session_id
@@ -376,7 +436,7 @@ def get_or_create_session() -> str:
         else:
             st.session_state.session_id = str(uuid.uuid4())
     return st.session_state.session_id
-
+ 
 def inject_memory(prompt: str, force_latest: bool = False) -> str:
     hint_parts = []
     recovery_ctx = st.session_state.get("_recovery_context", {})
@@ -401,7 +461,7 @@ def inject_memory(prompt: str, force_latest: bool = False) -> str:
             lines.append(f"{role}: {str(m.get('content', ''))[:200]}")
         if lines: hint_parts.append("【最近对话】\n" + "\n".join(lines))
     return "\n\n".join(hint_parts)
-
+ 
 def init_session_on_startup() -> List[Dict]:
     try:
         session_id = get_or_create_session()
@@ -420,7 +480,7 @@ def init_session_on_startup() -> List[Dict]:
     except Exception as e:
         logger.warning(f"会话初始化失败: {e}")
         return []
-
+ 
 # ================= SQLite 缓存兜底 =================
 def init_memory_db():
     conn = None
@@ -437,7 +497,7 @@ def init_memory_db():
         logger.error(f"SQLite初始化失败: {e}")
     finally:
         if conn: conn.close()
-
+ 
 def save_to_sqlite(session_id: str, round_num: int, round_messages: dict, ts: str):
     conn = None
     try:
@@ -450,7 +510,7 @@ def save_to_sqlite(session_id: str, round_num: int, round_messages: dict, ts: st
         logger.warning(f"SQLite写入失败: {e}")
     finally:
         if conn: conn.close()
-
+ 
 # ================= 百炼调用 =================
 def call_bailian_once(messages: List[Dict], mvars: Dict, hint: str) -> Tuple[str, int]:
     global _MODEL_HEALTHY
@@ -481,10 +541,10 @@ def call_bailian_once(messages: List[Dict], mvars: Dict, hint: str) -> Tuple[str
             logger.warning(f"第{attempt+1}次调用失败，2秒后重试: {e}")
             time.sleep(2)
     raise RuntimeError("❌ 模型调用失败")
-
+ 
 def get_market_vars() -> Dict[str, str]:
     return {"CURRENT_DATE": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"), "MARKET_SESSION": get_market_session(), "INDEX_STATUS": "正常", "VOLUME_TREND": "平稳"}
-
+ 
 def get_market_session() -> str:
     now = datetime.now(BEIJING_TZ).time()
     if now < dt_time(9, 15): return "盘前"
@@ -493,23 +553,23 @@ def get_market_session() -> str:
     elif now < dt_time(15, 0): return "下午"
     elif now < dt_time(15, 30): return "收盘"
     else: return "盘后"
-
+ 
 def export_txt(messages: List[Dict]) -> str:
     out = ""
     for m in messages:
         role = "用户" if m["role"] == "user" else "助手"
         out += f"{role}：{m.get('content', '')}\n\n"
     return out
-
+ 
 # ================= UI =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
-
+ 
 st.markdown("""<style>.stApp, section.main, .main, [data-testid="stAppViewContainer"] { background: #ffffff !important; transition: none !important; }.stChatInputContainer { position: sticky !important; bottom: 0 !important; background: #ffffff !important; padding: 12px 0 8px 0 !important; z-index: 999 !important; border-top: 1px solid #e5e7eb !important; }.stChatMessage { margin-bottom: 8px; }</style>""", unsafe_allow_html=True)
-
+ 
 st.title("📱 智飞投研")
-
+ 
 init_memory_db()
-
+ 
 if "messages" not in st.session_state:
     with st.spinner("🔄 正在从云端恢复历史记忆..."):
         st.session_state.messages = init_session_on_startup()
@@ -517,37 +577,37 @@ if "messages" not in st.session_state:
             st.session_state.messages = []
             st.session_state.session_id = str(uuid.uuid4())
         if "_recovery_context" not in st.session_state: st.session_state._recovery_context = {}
-
+ 
 for k, v in {"generating": False, "pending_generation": False, "render_offset": 0}.items():
     st.session_state.setdefault(k, v)
-
+ 
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"共 {total_rounds} 轮对话")
-
+ 
 total_msgs = len(st.session_state.messages)
 render_start = max(0, total_msgs - (st.session_state.render_offset + RENDER_ROUNDS) * 2)
 render_messages = st.session_state.messages[render_start:]
-
+ 
 for m in render_messages:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content", ""))
-
+ 
 if render_start > 0:
     if st.button("📥 加载更早对话", key="load_earlier", use_container_width=True):
         st.session_state.render_offset += RENDER_ROUNDS
         st.rerun()
-
+ 
 if st.session_state.generating:
     st.info("⏳ 正在处理上一条消息，请稍候...")
     
 user_input = st.chat_input("输入消息...")
-
+ 
 if user_input and not st.session_state.generating:
     st.session_state.generating = True
     st.session_state.pending_generation = True
     st.session_state.messages.append({"role": "user", "content": user_input, "timestamp": now_ts()})
     st.rerun()
-
+ 
 if st.session_state.pending_generation:
     st.session_state.pending_generation = False
     st.session_state.generating = True
@@ -576,7 +636,7 @@ if st.session_state.pending_generation:
     
     st.session_state.generating = False
     st.rerun()
-
+ 
 if st.session_state.messages:
     st.divider()
     col1, col2 = st.columns(2)
