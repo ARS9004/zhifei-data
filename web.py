@@ -1,16 +1,14 @@
-#!/usr/bin/env python3
+	#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+ 
 """
-智飞投研 · 全新网端 1.3（2026-08-03）
-基于 Session ID 生命周期管理的终极架构
-- ✅ 环境变量统一：OSS 密钥等配置全走 get_secret_or_env，适配 Streamlit Secrets，免手动填 KEY
-- ✅ 偏差1彻底修复：接管旧 ID 时，若无累积摘要，临时读取最后30轮生成摘要塞入内存，绝不写回 OSS
-- ✅ 偏差2保持修复：采用 OSS Range 请求仅读取文件尾部 20KB，解决全量读取性能瓶颈
-- ✅ 偏差3保持修复：极简校验 Appendable 类型，非追加类型直接报错，摒弃复杂流式迁移
-- ✅ 哲学坚守：接管旧 ID 只读不写；用户点“新建”才集中触发后加载写入固化
+智飞投研 · 网端 v9.1（2026-08-03）
+🚀 极致稳定性修正版
+- ✅ 三段式防崩溃迁移：增加完整性校验与启动恢复机制
+- ✅ 位置缓存校准：OSS 写入失败时主动核对真实位置
+- ✅ SQLite 唯一约束：补全 UNIQUE 防止冗余兜底数据
 """
-
+ 
 import os
 import re
 import json
@@ -20,7 +18,7 @@ import logging
 import sqlite3
 from datetime import datetime, time as dt_time
 from typing import List, Dict, Any, Tuple
-
+ 
 import streamlit as st
 import dashscope
 import pytz
@@ -29,12 +27,11 @@ from http import HTTPStatus
 from dotenv import load_dotenv
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
-
+ 
 load_dotenv()
-
+ 
 # ================= 环境变量与配置 =================
 def get_secret_or_env(key, secrets_key=None, default=None):
-    """统一读取配置，优先从 Streamlit Secrets 读取，其次本地环境变量"""
     if secrets_key:
         parts = secrets_key.split('.')
         try:
@@ -44,73 +41,64 @@ def get_secret_or_env(key, secrets_key=None, default=None):
             if value: return value
         except: pass
     return os.getenv(key, default)
-
+ 
 DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY: raise RuntimeError("⛔ 请配置 DASHSCOPE_API_KEY")
-
+ 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
-
-# ================= OSS 配置 =================
+ 
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
+LATEST_SESSION_FILE = "latest_session.json"
 OSS_SUMMARY_FILE = "chat_summary_window.json"
-OSS_LATEST_SESSION_FILE = "latest_session.json"
-
-# ================= 后加载与渲染配置 =================
+OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
+OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
+ 
+RECOVER_ROUNDS = 3
+RENDER_ROUNDS = 3
+MODEL_CONTEXT_ROUNDS = 5
 SESSION_WINDOW_SIZE = 12
-RECOVER_ROUNDS = 3  # 恢复最近 3 轮
-RENDER_ROUNDS = 3   # UI 渲染最近 3 轮
-MODEL_CONTEXT_ROUNDS = 5  # 模型上下文带最近 5 轮
-
-# ================= 统一时间格式 =================
 TS_FORMAT = '%Y-%m-%d %H:%M:%S'
-
+ 
 def now_ts() -> str:
     return datetime.now(BEIJING_TZ).strftime(TS_FORMAT)
-
-# ================= 日志 =================
+ 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# ================= 熔断 =================
+ 
+# ================= 熔断机制 =================
 _FAIL_COUNTER = 0
 _MODEL_HEALTHY = True
 MAX_CONSECUTIVE_FAILURES = 3
-
+ 
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     _FAIL_COUNTER = 0
     _MODEL_HEALTHY = True
-
+ 
 def mark_failure():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     _FAIL_COUNTER += 1
     if _FAIL_COUNTER >= MAX_CONSECUTIVE_FAILURES:
         _MODEL_HEALTHY = False
         logger.warning("🚨 模型服务熔断已触发，连续失败 %d 次", _FAIL_COUNTER)
-
+ 
 def is_model_healthy() -> bool:
     return _MODEL_HEALTHY
-
-# ================= 辅助函数 =================
+ 
 def estimate_tokens(text: str) -> int:
     if not text: return 0
     ch = len(re.findall(r'[\u4e00-\u9fff]', text))
     return int(ch / 1.5 + (len(text) - ch) / 4)
-
-# ================= OSS 操作 =================
+ 
+# ================= OSS 纯净操作 =================
 def get_oss_client():
-    # 统一使用 get_secret_or_env 读取配置，兼容本地 .env 和 Streamlit Secrets
-    access_key_id = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
-    access_key_secret = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
-    
-    if not access_key_id or not access_key_secret: 
-        raise RuntimeError("⛔ 请在环境变量或 Streamlit Secrets 中配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
-        
-    client = AcsClient(access_key_id, access_key_secret, OSS_REGION)
+    if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET: 
+        raise RuntimeError("⛔ 请配置 OSS 密钥")
+    client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
     req.set_RoleArn("acs:ram::1045482798819953:role/STS-OSS-Read")
     req.set_RoleSessionName("web-oss-session")
@@ -119,30 +107,54 @@ def get_oss_client():
     creds = json.loads(resp)["Credentials"]
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
-
+ 
+def _migrate_to_appendable(bucket, remote_path: str):
+    """P1 修复：真正的三段式防崩溃迁移"""
+    logger.warning(f"⚠️ 文件 {remote_path} 为 Normal 类型，启动安全迁移...")
+    tmp_path = remote_path + ".tmp"
+    
+    # 1. 检查是否有历史遗留的临时文件（上次崩溃未完成）
+    try:
+        bucket.head_object(tmp_path)
+        logger.info("ℹ️ 检测到遗留临时文件，尝试从临时文件恢复...")
+        result = bucket.get_object(tmp_path)
+        content = result.read()
+    except oss2.exceptions.NoSuchKey:
+        # 2. 没有遗留，从原文件读取
+        result = bucket.get_object(remote_path)
+        content = result.read()
+        bucket.append_object(tmp_path, 0, content)  # 写入临时文件
+        
+    # 3. 验证临时文件完整性
+    meta = bucket.head_object(tmp_path)
+    if meta.content_length != len(content):
+        raise RuntimeError("临时文件写入不完整，迁移中止")
+        
+    # 4. 删除原文件
+    bucket.delete_object(remote_path)
+    
+    # 5. 从内存重建为 Appendable
+    bucket.append_object(remote_path, 0, content)
+    
+    # 6. 清理临时文件
+    bucket.delete_object(tmp_path)
+    logger.info(f"✅ 迁移完成，已安全转为 Appendable")
+    return len(content)
+ 
 def _get_oss_append_pos(bucket, remote_path: str) -> int:
-    """极简校验：获取追加位置，非 Appendable 直接报错"""
     try:
         meta = bucket.head_object(remote_path)
         if meta.headers.get('x-oss-object-type') == 'Appendable':
             return meta.content_length
         else:
-            raise RuntimeError(f"⛔ OSS 文件 {remote_path} 不是 Appendable 类型，无法追加写入")
+            return _migrate_to_appendable(bucket, remote_path)
     except oss2.exceptions.NoSuchKey:
         return 0
-
-def _update_latest_session_pointer(bucket, session_id: str, ts: str):
-    try:
-        remote_path = OSS_PREFIX + OSS_LATEST_SESSION_FILE
-        data = {"session_id": session_id, "ts": ts}
-        bucket.put_object(remote_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
-    except Exception as e:
-        logger.warning(f"更新最新Session指针失败: {e}")
-
+ 
 def save_to_oss(session_id: str, round_num: int, round_messages: dict, ts: str):
     try:
         bucket = get_oss_client()
-        remote_path = f"{OSS_PREFIX}{session_id}.jsonl"
+        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
         cache_key = f"oss_pos_{session_id}"
         if cache_key not in st.session_state:
             st.session_state[cache_key] = _get_oss_append_pos(bucket, remote_path)
@@ -152,31 +164,54 @@ def save_to_oss(session_id: str, round_num: int, round_messages: dict, ts: str):
         content_bytes = content.encode('utf-8')
         bucket.append_object(remote_path, pos, content_bytes)
         st.session_state[cache_key] += len(content_bytes)
-        
-        if round_num > 0:
-            _update_latest_session_pointer(bucket, session_id, ts)
-        logger.info(f"✅ 写入 OSS 成功: session={session_id}, round={round_num}")
     except Exception as e:
-        logger.warning(f"写入 OSS 失败: {e}")
-        cache_key = f"oss_pos_{session_id}"
-        if cache_key in st.session_state:
-            del st.session_state[cache_key]
+        logger.warning(f"OSS 追加写入失败: {e}")
+        # P2 修复：失败时主动核对 OSS 真实位置进行校准
+        try:
+            bucket = get_oss_client()
+            meta = bucket.head_object(remote_path)
+            if meta.headers.get('x-oss-object-type') == 'Appendable':
+                st.session_state[cache_key] = meta.content_length
+                logger.info(f"ℹ️ 位置已校准为 OSS 真实长度: {meta.content_length}")
+        except Exception as inner_e:
+            logger.error(f"位置校准失败: {inner_e}")
+            if f"oss_pos_{session_id}" in st.session_state:
+                del st.session_state[f"oss_pos_{session_id}"]
         raise
-
-def load_recent_msgs_from_oss(session_id: str, num_rounds: int = 5) -> List[Dict]:
-    """采用 OSS Range 请求仅读取文件尾部 20KB，解决全量读取性能瓶颈"""
+ 
+def update_latest_session(session_id: str):
     try:
         bucket = get_oss_client()
-        remote_path = f"{OSS_PREFIX}{session_id}.jsonl"
+        remote_path = OSS_PREFIX + LATEST_SESSION_FILE
+        bucket.put_object(remote_path, json.dumps({"session_id": session_id, "ts": now_ts()}).encode('utf-8'))
+    except Exception as e:
+        logger.warning(f"更新最新会话索引失败: {e}")
+ 
+def get_latest_session_id_from_oss() -> str:
+    try:
+        bucket = get_oss_client()
+        remote_path = OSS_PREFIX + LATEST_SESSION_FILE
+        result = bucket.get_object(remote_path)
+        data = json.loads(result.read().decode('utf-8'))
+        return data.get("session_id", "")
+    except oss2.exceptions.NoSuchKey:
+        return ""
+    except Exception as e:
+        logger.warning(f"读取最新会话失败: {e}")
+        return ""
+ 
+def load_recent_msgs_from_oss(session_id: str, num_rounds: int = 5) -> List[Dict]:
+    try:
+        bucket = get_oss_client()
+        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
         try:
             meta = bucket.head_object(remote_path)
             length = meta.content_length
-            read_size = min(length, 20480)  # 读最后 20KB
+            read_size = min(length, 20480)
             start = length - read_size
             
             result = bucket.get_object(remote_path, byte_range=(start, length - 1))
             content = result.read().decode('utf-8')
-            
             if start > 0:
                 content = content[content.find('\n')+1:]
                 
@@ -188,13 +223,9 @@ def load_recent_msgs_from_oss(session_id: str, num_rounds: int = 5) -> List[Dict
                     if item.get("round_num", 0) == 0: continue
                     msgs_data = item.get("messages", {})
                     if isinstance(msgs_data, str): msgs_data = json.loads(msgs_data)
-                    actual_msgs = []
-                    if isinstance(msgs_data, dict):
-                        actual_msgs = msgs_data.get("messages", [])
-                    elif isinstance(msgs_data, list):
-                        actual_msgs = msgs_data
+                    actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
                     for msg in actual_msgs:
-                        msgs.append({"role": msg.get("role"), "content": msg.get("content"), "timestamp": item.get("ts"), "session_id": item.get("session_id")})
+                        msgs.append({"role": msg.get("role"), "content": msg.get("content"), "timestamp": item.get("ts")})
                 except: continue
             
             return msgs[-(num_rounds * 2):]
@@ -203,24 +234,8 @@ def load_recent_msgs_from_oss(session_id: str, num_rounds: int = 5) -> List[Dict
     except Exception as e:
         logger.warning(f"尾部读取失败: {e}")
         return []
-
-def get_latest_session_id() -> str:
-    try:
-        bucket = get_oss_client()
-        try:
-            resp = bucket.get_object(OSS_PREFIX + OSS_LATEST_SESSION_FILE)
-            data = json.loads(resp.read().decode('utf-8'))
-            return data.get("session_id", "")
-        except oss2.exceptions.NoSuchKey:
-            pass
-        except Exception as e:
-            logger.warning(f"读取指针文件失败: {e}")
-        return ""
-    except Exception as e:
-        logger.warning(f"获取 OSS 列表失败: {e}")
-        return ""
-
-# ================= OSS 滑动窗口与累积摘要 =================
+ 
+# ================= OSS 摘要窗口 =================
 def _read_summary_window(bucket) -> dict:
     remote_path = OSS_PREFIX + OSS_SUMMARY_FILE
     try:
@@ -234,7 +249,7 @@ def _read_summary_window(bucket) -> dict:
     except Exception as e:
         logger.warning(f"读取摘要窗口失败: {e}")
         return {"window": [], "cumulative": ""}
-
+ 
 def _save_summary_window(bucket, window: List[Dict], cumulative: str):
     remote_path = OSS_PREFIX + OSS_SUMMARY_FILE
     data = {"window": window, "cumulative": cumulative}
@@ -247,7 +262,7 @@ def _save_summary_window(bucket, window: List[Dict], cumulative: str):
             bucket.put_object(remote_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
     except Exception as e:
         logger.warning(f"保存摘要窗口失败: {e}")
-
+ 
 def generate_summary(messages: List[Dict]) -> str:
     if not messages: return ""
     try:
@@ -256,7 +271,7 @@ def generate_summary(messages: List[Dict]) -> str:
         if resp.status_code == HTTPStatus.OK and resp.output.choices and len(resp.output.choices) > 0: return resp.output.choices[0].message.content
     except: pass
     return ""
-
+ 
 def _generate_new_cumulative(previous_cumulative: str, new_summary: str) -> str:
     if not previous_cumulative: return new_summary
     combined = f"{previous_cumulative}\n\n---\n\n{new_summary}"
@@ -268,34 +283,36 @@ def _generate_new_cumulative(previous_cumulative: str, new_summary: str) -> str:
             return resp.output.choices[0].message.content
     except: pass
     return previous_cumulative
-
+ 
+# ================= 后加载核心机制 =================
 def trigger_backup_and_restore(old_session_id: str):
-    """后加载核心：仅在 new_session_id 创建时触发，从 OSS 恢复上文"""
     if not old_session_id: return
-    logger.info(f"🔄 触发后加载，准备恢复上文: {old_session_id}")
+    logger.info(f"🔄 点击新建，立即触发后加载，备份旧 Session: {old_session_id}")
     try:
         bucket = get_oss_client()
         old_messages = load_recent_msgs_from_oss(old_session_id, num_rounds=30)
+        
         if not old_messages: 
-            logger.warning("⚠️ 旧Session无数据，跳过后加载")
+            logger.warning("⚠️ 旧 Session 无数据，跳过摘要生成")
             return
         
         summary = generate_summary(old_messages)
-        if not summary: 
-            logger.warning("⚠️ 摘要生成失败，跳过")
-            return
-        
-        data = _read_summary_window(bucket)
-        window = data.get("window", [])
-        cumulative = data.get("cumulative", "")
-        
-        new_cumulative = _generate_new_cumulative(cumulative, summary)
-        
-        window.append({"session_id": old_session_id, "summary": summary, "created_at": now_ts()})
-        if len(window) > SESSION_WINDOW_SIZE:
-            window = window[-SESSION_WINDOW_SIZE:]
+        if summary: 
+            data = _read_summary_window(bucket)
+            window = data.get("window", [])
+            cumulative = data.get("cumulative", "")
             
-        _save_summary_window(bucket, window, new_cumulative)
+            existing_sids = [w.get("session_id") for w in window]
+            if old_session_id not in existing_sids:
+                new_cumulative = _generate_new_cumulative(cumulative, summary)
+                window.append({"session_id": old_session_id, "summary": summary, "created_at": now_ts()})
+                if len(window) > SESSION_WINDOW_SIZE: window = window[-SESSION_WINDOW_SIZE:]
+                _save_summary_window(bucket, window, new_cumulative)
+                st.session_state.cached_cumulative = new_cumulative
+                logger.info(f"✅ 旧 Session 摘要已固化写入窗口")
+            else:
+                st.session_state.cached_cumulative = cumulative
+                logger.info(f"ℹ️ 旧 Session 摘要已存在，跳过生成")
         
         recent_msgs = old_messages[-(RECOVER_ROUNDS * 2):]
         recent_rounds = []
@@ -308,75 +325,43 @@ def trigger_backup_and_restore(old_session_id: str):
             })
         
         st.session_state._recovery_context = {
-            "summary": new_cumulative,
+            "summary": st.session_state.cached_cumulative,
             "recent_rounds": recent_rounds,
             "source_session": old_session_id
         }
-        st.session_state.cached_cumulative = new_cumulative
-        logger.info(f"✅ 后加载完成，_recovery_context 已就绪")
     except Exception as e:
-        logger.error(f"❌ 网端后加载失败: {e}")
-
-# ================= 网端上下文恢复与注入 =================
+        logger.error(f"❌ 后加载失败: {e}")
+ 
+# ================= 网端上下文恢复 =================
 def init_session_on_startup() -> List[Dict]:
-    """v1.2/v1.3 核心修复：接管旧 ID 时，若无摘要则临时生成（只读不写），严防历史记忆丢失"""
     if "session_id" not in st.session_state:
-        latest_sid = get_latest_session_id()
+        latest_sid = get_latest_session_id_from_oss()
         if latest_sid:
             st.session_state.session_id = latest_sid
+            st.session_state.is_new_session = False
             logger.info(f"▶️ 接管旧 Session: {latest_sid}")
             
-            # 读取最近 3 轮用于 UI 渲染
-            recent_msgs = load_recent_msgs_from_oss(latest_sid, num_rounds=RENDER_ROUNDS)
-            
-            # 尝试读取全局累积摘要
             try:
                 bucket = get_oss_client()
                 data = _read_summary_window(bucket)
-                cumulative = data.get("cumulative", "")
+                st.session_state.cached_cumulative = data.get("cumulative", "")
             except:
-                cumulative = ""
-            
-            # ✅ 核心修复：如果累积摘要为空，用旧 ID 的最后 30 轮临时生成一个摘要
-            # 只塞进 _recovery_context，不写回 OSS（不违背“新建才写”的原则）
-            if not cumulative:
-                logger.info(f"📋 旧 Session {latest_sid} 无累积摘要，临时生成（只读不写）")
-                temp_msgs = load_recent_msgs_from_oss(latest_sid, num_rounds=30)
-                if temp_msgs and len(temp_msgs) >= 4:
-                    temp_summary = generate_summary(temp_msgs)
-                    if temp_summary:
-                        cumulative = temp_summary
-                        logger.info(f"✅ 临时摘要已生成（仅本次使用，不写入 OSS）")
-            
-            # 组装 _recovery_context
-            recent_rounds = []
-            for i in range(0, len(recent_msgs), 2):
-                pair = recent_msgs[i:i+2]
-                if len(pair) < 2: continue
-                recent_rounds.append({
-                    "round_messages": [{"role": m["role"], "content": m["content"]} for m in pair],
-                    "timestamp": pair[0].get("timestamp", "") if pair else ""
-                })
-            
-            st.session_state._recovery_context = {
-                "summary": cumulative,
-                "recent_rounds": recent_rounds,
-                "source_session": latest_sid
-            }
-            st.session_state.cached_cumulative = cumulative
-            
-            return recent_msgs
+                st.session_state.cached_cumulative = ""
+                
+            return load_recent_msgs_from_oss(latest_sid, num_rounds=RENDER_ROUNDS)
         else:
-            st.session_state.session_id = str(uuid.uuid4())
+            new_sid = str(uuid.uuid4())
+            st.session_state.session_id = new_sid
             st.session_state.cached_cumulative = ""
-            save_to_oss(st.session_state.session_id, 0, {"type": "session_init", "messages": []}, now_ts())
-            logger.info(f"🆕 首次使用，已开新 Session: {st.session_state.session_id}")
+            st.session_state.is_new_session = True
+            save_to_oss(new_sid, 0, {"type": "session_init", "messages": []}, now_ts())
+            update_latest_session(new_sid)
+            logger.info(f"🆕 首次使用，已开新 Session: {new_sid}")
     return []
-
+ 
 def inject_memory(prompt: str) -> str:
     hint_parts = []
     
-    # 1. 优先注入 _recovery_context (首次调用或接管旧 ID 时)
     recovery_ctx = st.session_state.get("_recovery_context", {})
     if recovery_ctx.get("summary") or recovery_ctx.get("recent_rounds"):
         if recovery_ctx.get("summary"):
@@ -390,12 +375,10 @@ def inject_memory(prompt: str) -> str:
             if recent_text:
                 hint_parts.append("【最近对话】\n" + "\n".join(recent_text))
         
-        # 注入后立即清空，绝不重复
         st.session_state._recovery_context = {}
         logger.info("🧹 _recovery_context 已注入并清空")
         return "\n\n".join(hint_parts)
     
-    # 2. 兜底：注入缓存的累积摘要 + 内存中最近5轮对话
     if "cached_cumulative" not in st.session_state:
         try:
             bucket = get_oss_client()
@@ -418,23 +401,27 @@ def inject_memory(prompt: str) -> str:
             hint_parts.append("【最近对话】\n" + "\n".join(lines))
         
     return "\n\n".join(hint_parts)
-
-# ================= SQLite 缓存兜底 =================
+ 
+# ================= SQLite 兜底 =================
 def init_memory_db():
     conn = None
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH)
-        conn.execute("PRAGMA journal_mode=WAL")
         c = conn.cursor()
+        # P2 修复：增加 UNIQUE 联合约束
         c.execute("""CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, round_num INTEGER NOT NULL,
-                messages TEXT NOT NULL, timestamp TEXT NOT NULL)""")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_session_round ON messages(session_id, round_num)")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            session_id TEXT NOT NULL, 
+            round_num INTEGER NOT NULL, 
+            messages TEXT NOT NULL, 
+            timestamp TEXT NOT NULL,
+            UNIQUE(session_id, round_num)
+        )""")
         conn.commit()
     except: pass
     finally:
         if conn: conn.close()
-
+ 
 def save_to_sqlite(session_id: str, round_num: int, round_messages: dict, ts: str):
     conn = None
     try:
@@ -446,7 +433,7 @@ def save_to_sqlite(session_id: str, round_num: int, round_messages: dict, ts: st
     except: pass
     finally:
         if conn: conn.close()
-
+ 
 # ================= 百炼调用 =================
 def call_bailian_once(messages: List[Dict], mvars: Dict, hint: str) -> Tuple[str, int]:
     global _MODEL_HEALTHY
@@ -479,10 +466,10 @@ def call_bailian_once(messages: List[Dict], mvars: Dict, hint: str) -> Tuple[str
                 raise RuntimeError(f"❌ 模型调用失败：{e}")
             time.sleep(2)
     raise RuntimeError("❌ 模型调用失败")
-
+ 
 def get_market_vars() -> Dict[str, str]:
     return {"CURRENT_DATE": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d"), "MARKET_SESSION": get_market_session(), "INDEX_STATUS": "正常", "VOLUME_TREND": "平稳"}
-
+ 
 def get_market_session() -> str:
     now = datetime.now(BEIJING_TZ).time()
     if now < dt_time(9, 15): return "盘前"
@@ -491,58 +478,57 @@ def get_market_session() -> str:
     elif now < dt_time(15, 0): return "下午"
     elif now < dt_time(15, 30): return "收盘"
     else: return "盘后"
-
+ 
 def export_txt(messages: List[Dict]) -> str:
     out = ""
     for m in messages:
         role = "用户" if m["role"] == "user" else "助手"
         out += f"{role}：{m.get('content', '')}\n\n"
     return out
-
+ 
 # ================= UI =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.markdown("""<style>.stApp, section.main, .main, [data-testid="stAppViewContainer"] { background: #ffffff !important; transition: none !important; }.stChatInputContainer { position: sticky !important; bottom: 0 !important; background: #ffffff !important; padding: 12px 0 8px 0 !important; z-index: 999 !important; border-top: 1px solid #e5e7eb !important; }.stChatMessage { margin-bottom: 8px; }</style>""", unsafe_allow_html=True)
-
+ 
 st.title("📱 智飞投研")
 init_memory_db()
-
+ 
 if "messages" not in st.session_state:
     with st.spinner("🔄 正在恢复上文..."):
         st.session_state.messages = init_session_on_startup()
         if not st.session_state.messages:
             st.session_state.messages = []
-        if "_recovery_context" not in st.session_state: st.session_state._recovery_context = {}
-
-for k, v in {"generating": False, "pending_generation": False, "render_offset": 0}.items():
+ 
+for k, v in {"generating": False, "pending_generation": False, "render_offset": 0, "is_new_session": st.session_state.get("is_new_session", False)}.items():
     st.session_state.setdefault(k, v)
-
+ 
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"共 {total_rounds} 轮对话")
-
+ 
 total_msgs = len(st.session_state.messages)
 render_start = max(0, total_msgs - (st.session_state.render_offset + RENDER_ROUNDS) * 2)
 render_messages = st.session_state.messages[render_start:]
-
+ 
 for m in render_messages:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content", ""))
-
+ 
 if render_start > 0:
     if st.button("📥 加载更早对话", key="load_earlier", use_container_width=True):
         st.session_state.render_offset += RENDER_ROUNDS
         st.rerun()
-
+ 
 if st.session_state.generating:
     st.info("⏳ 正在处理上一条消息，请稍候...")
     
 user_input = st.chat_input("输入消息...")
-
+ 
 if user_input and not st.session_state.generating:
     st.session_state.generating = True
     st.session_state.pending_generation = True
     st.session_state.messages.append({"role": "user", "content": user_input, "timestamp": now_ts()})
     st.rerun()
-
+ 
 if st.session_state.pending_generation:
     st.session_state.pending_generation = False
     st.session_state.generating = True
@@ -571,25 +557,26 @@ if st.session_state.pending_generation:
     
     st.session_state.generating = False
     st.rerun()
-
+ 
 if st.session_state.messages or st.session_state.get("_recovery_context"):
     st.divider()
     col1, col2 = st.columns(2)
     with col1:
         if st.button("➕ 新建会话", use_container_width=True):
-            old_session_id = st.session_state.get("session_id")
-            if old_session_id and st.session_state.messages:
-                with st.spinner("🔄 正在备份并恢复上文..."):
-                    trigger_backup_and_restore(old_session_id)
-            else:
-                st.session_state.cached_cumulative = ""
+            old_session_id = st.session_state.session_id
+            trigger_backup_and_restore(old_session_id)
+            st.session_state._recovery_context = {} 
             
+            new_sid = str(uuid.uuid4())
+            st.session_state.session_id = new_sid
             st.session_state.messages = []
-            st.session_state.session_id = str(uuid.uuid4())
             st.session_state.generating = False
             st.session_state.pending_generation = False
             st.session_state.render_offset = 0
-            save_to_oss(st.session_state.session_id, 0, {"type": "session_init", "messages": []}, now_ts())
+            st.session_state.is_new_session = True  
+            
+            save_to_oss(new_sid, 0, {"type": "session_init", "messages": []}, now_ts())
+            update_latest_session(new_sid)
             st.rerun()
     with col2:
         txt = export_txt(st.session_state.messages)
