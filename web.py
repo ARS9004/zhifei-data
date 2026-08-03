@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 全新网端 1.2（2026-08-03）
+智飞投研 · 全新网端 1.3（2026-08-03）
 基于 Session ID 生命周期管理的终极架构
+- ✅ 环境变量统一：OSS 密钥等配置全走 get_secret_or_env，适配 Streamlit Secrets，免手动填 KEY
 - ✅ 偏差1彻底修复：接管旧 ID 时，若无累积摘要，临时读取最后30轮生成摘要塞入内存，绝不写回 OSS
 - ✅ 偏差2保持修复：采用 OSS Range 请求仅读取文件尾部 20KB，解决全量读取性能瓶颈
 - ✅ 偏差3保持修复：极简校验 Appendable 类型，非追加类型直接报错，摒弃复杂流式迁移
@@ -31,8 +32,9 @@ from aliyunsdksts.request.v20150401 import AssumeRoleRequest
 
 load_dotenv()
 
-# ================= 环境变量 =================
+# ================= 环境变量与配置 =================
 def get_secret_or_env(key, secrets_key=None, default=None):
+    """统一读取配置，优先从 Streamlit Secrets 读取，其次本地环境变量"""
     if secrets_key:
         parts = secrets_key.split('.')
         try:
@@ -101,9 +103,13 @@ def estimate_tokens(text: str) -> int:
 
 # ================= OSS 操作 =================
 def get_oss_client():
-    access_key_id = os.getenv("OSS_ACCESS_KEY_ID")
-    access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET")
-    if not access_key_id or not access_key_secret: raise RuntimeError("⛔ 请配置 OSS 密钥")
+    # 统一使用 get_secret_or_env 读取配置，兼容本地 .env 和 Streamlit Secrets
+    access_key_id = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
+    access_key_secret = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
+    
+    if not access_key_id or not access_key_secret: 
+        raise RuntimeError("⛔ 请在环境变量或 Streamlit Secrets 中配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
+        
     client = AcsClient(access_key_id, access_key_secret, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
     req.set_RoleArn("acs:ram::1045482798819953:role/STS-OSS-Read")
@@ -264,6 +270,7 @@ def _generate_new_cumulative(previous_cumulative: str, new_summary: str) -> str:
     return previous_cumulative
 
 def trigger_backup_and_restore(old_session_id: str):
+    """后加载核心：仅在 new_session_id 创建时触发，从 OSS 恢复上文"""
     if not old_session_id: return
     logger.info(f"🔄 触发后加载，准备恢复上文: {old_session_id}")
     try:
@@ -312,7 +319,7 @@ def trigger_backup_and_restore(old_session_id: str):
 
 # ================= 网端上下文恢复与注入 =================
 def init_session_on_startup() -> List[Dict]:
-    """v1.2 核心修复：接管旧 ID 时，若无摘要则临时生成（只读不写），严防历史记忆丢失"""
+    """v1.2/v1.3 核心修复：接管旧 ID 时，若无摘要则临时生成（只读不写），严防历史记忆丢失"""
     if "session_id" not in st.session_state:
         latest_sid = get_latest_session_id()
         if latest_sid:
