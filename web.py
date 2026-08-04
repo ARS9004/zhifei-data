@@ -4,6 +4,7 @@
 """
 智飞投研 · 云端轻量版 v11（2026-08-04）
 - 基于 V10，恢复 V7 稳定的 load_session_from_oss
+- 新增 get_valid_latest_session：指针失效时自动扫描 OSS 目录兜底
 - 模型自主从 OSS 恢复上文（call_bailian 告诉路径）
 - 纯 OSS 架构，无 RDS 依赖
 """
@@ -186,6 +187,38 @@ def get_latest_session_id_from_oss() -> tuple:
     except Exception as e:
         logger.warning(f"读取最新 Session 失败: {e}")
         return "", ""
+
+
+# V11 新增：指针失效时自动扫描 OSS 目录兜底
+def get_valid_latest_session() -> tuple:
+    """获取有效的最新 Session：优先读 latest_session.json，失败则扫描 OSS 目录"""
+    # 1. 优先读指针文件
+    sid, ts = get_latest_session_id_from_oss()
+    if sid:
+        # 验证这个 session 是否有数据
+        msgs = load_session_from_oss(sid, num_rounds=1)
+        if msgs:
+            return sid, ts
+        logger.warning(f"⚠️ latest_session.json 指向 {sid}，但该 session 无数据，回退扫描 OSS 目录")
+
+    # 2. 指针文件无效，扫描 OSS 目录找最新的有数据的 session
+    try:
+        bucket = get_oss_client()
+        latest_file = None
+        latest_time = 0
+        for obj in oss2.ObjectIterator(bucket, prefix=OSS_PREFIX):
+            if obj.key.endswith('.jsonl') and not obj.key.endswith('.tmp_append'):
+                if obj.last_modified > latest_time:
+                    latest_time = obj.last_modified
+                    latest_file = obj.key
+        if latest_file:
+            sid = latest_file.split('/')[-1].replace('.jsonl', '')
+            logger.info(f"✅ 扫描 OSS 目录找到有效 session: {sid}")
+            return sid, datetime.fromtimestamp(latest_time).isoformat()
+    except Exception as e:
+        logger.warning(f"扫描 OSS 目录失败: {e}")
+
+    return "", ""
 
 
 # V11 核心：load_session_from_oss 恢复 V7 稳定版
@@ -511,11 +544,13 @@ def init_session_on_startup():
         st.session_state.cached_summary = ""
 
     if not st.session_state.messages and not st.session_state.history_loaded:
-        session_id, ts = get_latest_session_id_from_oss()
+        # V11 修复：使用 get_valid_latest_session，指针失效时自动扫描 OSS 目录兜底
+        session_id, ts = get_valid_latest_session()
         if session_id:
             st.session_state.session_id = session_id
         else:
             st.session_state.session_id = str(uuid.uuid4())
+            logger.info(f"🆕 未找到任何历史 Session，新建: {st.session_state.session_id}")
 
         msgs = load_session_from_oss(st.session_state.session_id, num_rounds=3)
         if msgs:
