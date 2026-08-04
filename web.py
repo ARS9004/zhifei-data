@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v7（2026-08-04）
-- 统一读写路径：按 Session 隔离的独立文件 `{session_id}.jsonl`
-- `latest_session.json` 作为最新 Session 指针，读写完整
-- 新建会话自动更新指针，页面刷新不丢上下文
-- 纯 OSS 架构，无 RDS 依赖
+智飞投研 · 云端轻量版 v7.2（2026-08-01）
+- 手机端专用：OSS 实时同步（每轮写），摘要 + 3轮对话恢复
+- 双写：RDS + SQLite + OSS（实时三写），每10轮额外校验
+- 无侧边栏、无历史会话、无编辑删除
+- ✅ 新增：熔断分级 & 摘要本地缓存
+- ✅ 用户消息立即渲染，不等模型回复
 """
 
 import os
@@ -17,11 +18,12 @@ import uuid
 import logging
 import sqlite3
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import streamlit as st
 import dashscope
 import oss2
+import pymysql
 import pytz
 from http import HTTPStatus
 from dotenv import load_dotenv
@@ -30,7 +32,7 @@ from aliyunsdksts.request.v20150401 import AssumeRoleRequest
 
 load_dotenv()
 
-
+# ================= 环境变量（兼容 .env 和 st.secrets） =================
 def get_secret_or_env(key, secrets_key=None, default=None):
     if secrets_key:
         parts = secrets_key.split('.')
@@ -44,36 +46,47 @@ def get_secret_or_env(key, secrets_key=None, default=None):
             pass
     return os.getenv(key, default)
 
-
 DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY:
-    raise RuntimeError("请配置 DASHSCOPE_API_KEY")
+    raise RuntimeError("⛔ 请配置 DASHSCOPE_API_KEY")
 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 
+# ================= RDS 配置 =================
+RDS_HOST = get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com")
+RDS_PORT = int(get_secret_or_env("RDS_PORT", "rds.port", 3306))
+RDS_USER = get_secret_or_env("RDS_USER", "rds.user", "zhuanz1")
+RDS_PASSWORD = get_secret_or_env("RDS_PASSWORD", "rds.password", "zhuanz1_2026")
+RDS_DATABASE = get_secret_or_env("RDS_DATABASE", "rds.database", "stock_db")
+RDS_CHAT_TABLE = "chat_memory"
+
+# ================= OSS 配置 =================
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
+OSS_FILENAME = "chat_history.jsonl"
+OSS_SUMMARY_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 
+if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET:
+    raise RuntimeError("⛔ 请配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
+
+# ================= 日志 =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
-# ================= 熔断 =================
+# ================= 熔断（升级版：按错误类型分级） =================
 _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
 _MODEL_HEALTHY = True
 _MAX_CONSECUTIVE_FAILURES = {"network": 5, "api": 3, "model": 2}
-
 
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
     _MODEL_HEALTHY = True
-
 
 def mark_failure(error_type: str):
     global _FAIL_COUNTER, _MODEL_HEALTHY
@@ -82,20 +95,46 @@ def mark_failure(error_type: str):
     _FAIL_COUNTER[error_type] += 1
     if error_type == "model" and _FAIL_COUNTER["model"] >= _MAX_CONSECUTIVE_FAILURES["model"]:
         _MODEL_HEALTHY = False
-
+        logger.warning("⛔ 模型服务熔断：连续 %d 次模型调用失败", _FAIL_COUNTER["model"])
 
 def is_model_healthy() -> bool:
     return _MODEL_HEALTHY
 
+# ================= RDS 操作 =================
+def get_rds_connection():
+    return pymysql.connect(host=RDS_HOST, port=RDS_PORT, user=RDS_USER, password=RDS_PASSWORD, database=RDS_DATABASE, charset='utf8mb4')
 
-def estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    ch = len(re.findall(r'[\u4e00-\u9fff]', text))
-    return int(ch / 1.5 + (len(text) - ch) / 4)
+def get_or_create_session() -> str:
+    if "session_id" not in st.session_state:
+        try:
+            conn = get_rds_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT session_id FROM chat_memory ORDER BY ts DESC LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                st.session_state.session_id = row[0]
+            else:
+                st.session_state.session_id = str(uuid.uuid4())
+        except:
+            st.session_state.session_id = str(uuid.uuid4())
+    return st.session_state.session_id
 
+def save_to_rds(session_id: str, round_num: int, messages: dict, ts: str):
+    try:
+        conn = get_rds_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"INSERT INTO {RDS_CHAT_TABLE} (session_id, round_num, messages, ts) VALUES (%s, %s, %s, %s)",
+            (session_id, round_num, json.dumps(messages, ensure_ascii=False), ts)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"RDS 写入失败: {e}")
+        mark_failure("database")
 
-# ================= OSS 客户端 =================
+# ================= OSS 操作 =================
 def get_oss_client():
     client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
@@ -107,308 +146,147 @@ def get_oss_client():
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
-
-# ================= v7 核心：统一按 Session 隔离读写 =================
-
-def _ensure_appendable(bucket, remote_path: str) -> int:
-    """确保文件是 Appendable 类型，返回当前可追加位置"""
-    try:
-        meta = bucket.head_object(remote_path)
-        if meta.headers.get('x-oss-object-type') == 'Appendable':
-            return meta.content_length
-        else:
-            # Normal 类型 → 读出来重新用 Appendable 写入
-            result = bucket.get_object(remote_path)
-            content = result.read()
-            bucket.delete_object(remote_path)
-            bucket.append_object(remote_path, 0, content)
-            return len(content)
-    except oss2.exceptions.NoSuchKey:
-        return 0
-
-
-def write_session_to_oss(session_id: str, round_num: int, round_messages: dict, ts: str):
-    """按 Session 隔离写入：直接追加到 {session_id}.jsonl"""
+def read_oss():
     try:
         bucket = get_oss_client()
-        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
-        pos = _ensure_appendable(bucket, remote_path)
-
-        content = json.dumps({
-            "session_id": session_id,
-            "round_num": round_num,
-            "messages": round_messages,
-            "ts": ts
-        }, ensure_ascii=False) + '\n'
-
-        bucket.append_object(remote_path, pos, content.encode('utf-8'))
-        logger.info(f"✅ 写入 Session {session_id}, round {round_num}")
-
-        # 更新最新 Session 指针
-        _update_latest_session(session_id, ts)
-
-    except Exception as e:
-        logger.warning(f"写入 OSS 失败: {e}")
-        raise
-
-
-def _update_latest_session(session_id: str, ts: str):
-    """更新 latest_session.json 指针文件"""
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + "latest_session.json"
-        data = {"session_id": session_id, "ts": ts}
-        bucket.put_object(remote, json.dumps(data, ensure_ascii=False).encode('utf-8'))
-        logger.info(f"✅ 更新最新 Session 指针: {session_id}")
-    except Exception as e:
-        logger.warning(f"更新最新 Session 指针失败: {e}")
-
-
-def load_session_from_oss(session_id: str, num_rounds: int = 3) -> List[Dict]:
-    """从 {session_id}.jsonl 读取最近 N 轮对话"""
-    try:
-        bucket = get_oss_client()
-        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
-        try:
-            meta = bucket.head_object(remote_path)
-            length = meta.content_length
-            read_size = min(length, 20480)
-            start = length - read_size
-            result = bucket.get_object(remote_path, byte_range=(start, length - 1))
-            content = result.read().decode('utf-8')
-            if start > 0:
-                content = content[content.find('\n') + 1:]
-
-            all_msgs = []
-            for line in content.strip().split('\n'):
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                    if item.get("round_num", 0) == 0:
-                        continue
-                    msgs_data = item.get("messages", {})
-                    if isinstance(msgs_data, str):
-                        msgs_data = json.loads(msgs_data)
-                    actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
-                    for msg in actual_msgs:
-                        all_msgs.append({
-                            "role": msg.get("role"),
-                            "content": msg.get("content")
-                        })
-                except:
-                    continue
-
-            return all_msgs[-(num_rounds * 2):] if len(all_msgs) > num_rounds * 2 else all_msgs
-        except oss2.exceptions.NoSuchKey:
-            return []
-    except Exception as e:
-        logger.warning(f"读取 Session {session_id} 失败: {e}")
+        remote = OSS_PREFIX + OSS_FILENAME
+        result = bucket.get_object(remote)
+        content = result.read().decode('utf-8')
+        lines = [json.loads(line) for line in content.strip().split('\n') if line.strip()]
+        return lines
+    except:
         return []
 
-
-def get_latest_session_id_from_oss() -> tuple:
-    """从 latest_session.json 读取最新 Session ID 和 ts"""
+def write_oss(lines):
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + "latest_session.json"
-        result = bucket.get_object(remote)
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("session_id", ""), data.get("ts", "")
-    except Exception:
-        return "", ""
-
-
-# ================= 累积摘要读取 =================
-
-def get_cumulative_summary_from_oss() -> str:
-    """从 OSS 读取累积摘要"""
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + "chat_summary_window.json"
-        result = bucket.get_object(remote)
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("cumulative", "")
+        remote = OSS_PREFIX + OSS_FILENAME
+        content = "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n"
+        bucket.put_object(remote, content.encode('utf-8'))
+        return True
     except Exception as e:
-        logger.debug(f"读取累积摘要失败: {e}")
-        return ""
+        logger.warning(f"OSS 写入失败: {e}")
+        mark_failure("network")
+        return False
 
+def sync_to_oss(lines):
+    existing = read_oss()
+    existing_ids = {(m.get("session_id"), m.get("round_num")) for m in existing if isinstance(m, dict)}
+    new_lines = []
+    for m in lines:
+        if not isinstance(m, dict):
+            continue
+        key = (m.get("session_id"), m.get("round_num"))
+        if key not in existing_ids:
+            new_lines.append(m)
+            existing_ids.add(key)
+    if new_lines:
+        write_oss(existing + new_lines)
+        logger.info(f"✅ OSS 同步: {len(new_lines)} 条")
+    return len(new_lines)
 
-# ================= 后加载（保留） =================
-
-SESSION_WINDOW_SIZE = 12
-
-
-def _read_summary_window():
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + "chat_summary_window.json"
-        result = bucket.get_object(remote)
-        data = json.loads(result.read().decode('utf-8'))
-        data.setdefault("window", [])
-        data.setdefault("cumulative", "")
-        return data
-    except:
-        return {"window": [], "cumulative": ""}
-
-
-def _save_summary_window(window, cumulative):
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + "chat_summary_window.json"
-        data = {"window": window, "cumulative": cumulative}
-        bucket.put_object(remote, json.dumps(data, ensure_ascii=False).encode('utf-8'))
-    except Exception as e:
-        logger.warning(f"保存摘要窗口失败: {e}")
-
-
-def merge_cumulative(previous: str, new_summary: str) -> str:
-    if not previous:
-        return new_summary
-    try:
-        prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{previous}\n---\n{new_summary}"
-        dashscope.api_key = DASHSCOPE_API_KEY
-        resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-        if resp.status_code == HTTPStatus.OK and resp.output.choices:
-            return resp.output.choices[0].message.content
-    except:
-        pass
-    return previous
-
-
-def generate_summary(messages: List[Dict]) -> str:
-    if not messages:
-        return ""
-    try:
-        prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{json.dumps(messages, ensure_ascii=False)[:5000]}"
-        dashscope.api_key = DASHSCOPE_API_KEY
-        resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-        if resp.status_code == HTTPStatus.OK and resp.output.choices:
-            return resp.output.choices[0].message.content
-    except:
-        pass
-    return ""
-
-
-def load_full_session_from_oss(session_id: str) -> List[Dict]:
-    """后加载专用：读取旧 Session 的完整对话"""
-    try:
-        bucket = get_oss_client()
-        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
-        try:
-            resp = bucket.get_object(remote_path)
-            content = resp.read().decode('utf-8')
-            all_msgs = []
-            for line in content.strip().split('\n'):
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                    if item.get("round_num", 0) == 0:
-                        continue
-                    msgs_data = item.get("messages", {})
-                    if isinstance(msgs_data, str):
-                        msgs_data = json.loads(msgs_data)
-                    actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
-                    for msg in actual_msgs:
-                        all_msgs.append(msg)
-                except:
-                    continue
-            return all_msgs
-        except oss2.exceptions.NoSuchKey:
-            return []
-    except Exception as e:
-        logger.warning(f"读取完整 Session 失败: {e}")
+def get_recent_messages(limit=5):
+    lines = read_oss()
+    if not lines:
         return []
+    valid_lines = [item for item in lines if isinstance(item, dict)]
+    if not valid_lines:
+        return []
+    sorted_lines = sorted(valid_lines, key=lambda x: x.get("round_num", 0), reverse=True)
+    recent = sorted_lines[:limit]
+    result = []
+    for item in reversed(recent):
+        msgs_data = item.get("messages", {})
+        if isinstance(msgs_data, str):
+            try:
+                msgs_data = json.loads(msgs_data)
+            except:
+                msgs_data = {}
+        for msg in msgs_data.get("messages", []):
+            result.append({
+                "role": msg.get("role"),
+                "content": msg.get("content"),
+                "session_id": item.get("session_id"),
+                "round_num": item.get("round_num")
+            })
+    return result
 
+# ================= OSS 摘要缓存 =================
+_SUMMARY_CACHE = {"content": "", "ts": 0}
+_SUMMARY_CACHE_TTL = 60 * 5
 
-def trigger_backup_and_restore(old_session_id: str):
-    """新建会话时触发：固化旧 Session 摘要到窗口"""
-    if not old_session_id:
-        return
+def get_summary() -> str:
+    global _SUMMARY_CACHE
+    now = time.time()
+    if _SUMMARY_CACHE["ts"] > now - _SUMMARY_CACHE_TTL:
+        return _SUMMARY_CACHE["content"]
 
-    old_messages = load_full_session_from_oss(old_session_id)
-    if not old_messages:
-        return
+    try:
+        bucket = get_oss_client()
+        remote = OSS_PREFIX + OSS_SUMMARY_FILE
+        result = bucket.get_object(remote)
+        data = json.loads(result.read().decode('utf-8'))
+        content = data.get("summary", "")
+        _SUMMARY_CACHE = {"content": content, "ts": now}
+        return content
+    except Exception as e:
+        logger.warning(f"OSS 摘要读取失败，返回空摘要: {e}")
+        return ""
 
-    summary = generate_summary(old_messages)
-    if not summary:
-        return
-
-    data = _read_summary_window()
-    window = data["window"]
-    cumulative = data["cumulative"]
-
-    existing_sids = [w.get("session_id") for w in window]
-    if old_session_id not in existing_sids:
-        cumulative = merge_cumulative(cumulative, summary)
-        window.append({
-            "session_id": old_session_id,
-            "summary": summary,
-            "created_at": datetime.now(BEIJING_TZ).isoformat()
-        })
-        if len(window) > SESSION_WINDOW_SIZE:
-            window = window[-SESSION_WINDOW_SIZE:]
-        _save_summary_window(window, cumulative)
-
-
-# ================= SQLite 兜底 =================
-
+# ================= SQLite 操作 =================
 def init_memory_db():
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH)
         conn.execute("PRAGMA journal_mode=WAL")
         c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS chat_memory_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL, round_num INTEGER NOT NULL,
-            messages TEXT NOT NULL, ts TEXT NOT NULL
-        )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS chat_memory_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                round_num INTEGER NOT NULL,
+                messages TEXT NOT NULL,
+                ts TEXT NOT NULL
+            )
+        """)
         conn.commit()
         conn.close()
-    except:
-        pass
-
+    except Exception as e:
+        logger.error(f"SQLite 初始化失败: {e}")
 
 def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO chat_memory_new (session_id, round_num, messages, ts) VALUES (?, ?, ?, ?)",
-                       (session_id, round_num, json.dumps(messages, ensure_ascii=False), ts))
+        cursor.execute(
+            "INSERT INTO chat_memory_new (session_id, round_num, messages, ts) VALUES (?, ?, ?, ?)",
+            (session_id, round_num, json.dumps(messages, ensure_ascii=False), ts)
+        )
         conn.commit()
         conn.close()
-    except:
-        pass
-
-
-# ================= 模型调用 =================
+    except Exception as e:
+        logger.warning(f"SQLite 写入失败: {e}")
+        mark_failure("database")
 
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
 
-    sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
+    sys_parts = [
+        f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"
+    ]
 
-    session_id = st.session_state.get("session_id", "")
+    summary = get_summary()
+    if summary:
+        sys_parts.append(f"\n【历史对话摘要】\n{summary}")
 
-    # 1. 读累积摘要
-    cumulative = get_cumulative_summary_from_oss()
-    if cumulative:
-        sys_parts.append(f"\n【历史对话摘要】\n{cumulative}")
-
-    # 2. 读最近 5 轮对话
-    if session_id:
-        recent = load_session_from_oss(session_id, num_rounds=5)
-        if recent:
-            lines = []
-            for m in recent:
-                role = "用户" if m.get("role") == "user" else "助手"
-                content = m.get("content", "")[:300]
-                lines.append(f"{role}：{content}")
-            if lines:
-                sys_parts.append("\n【最近对话（用于接续上文）】\n" + "\n".join(lines))
+    recent = get_recent_messages(limit=3)
+    if recent:
+        sys_parts.append("\n【最近对话（用于接续上文）】")
+        for m in recent:
+            role = "用户" if m["role"] == "user" else "助手"
+            content = m.get("content", "")[:300]
+            sys_parts.append(f"{role}：{content}")
 
     sys_p = "\n".join(sys_parts)
     full_msgs = [{"role": "system", "content": sys_p}] + messages
@@ -416,13 +294,17 @@ def call_bailian(messages: List[Dict]) -> str:
     retries, delay = 3, 2
     for attempt in range(retries):
         try:
-            resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
+            resp = dashscope.Generation.call(
+                model=MODEL_NAME, messages=full_msgs,
+                result_format="message", stream=False
+            )
             if resp.status_code == HTTPStatus.OK and resp.output.choices:
                 reset_health_status()
                 return resp.output.choices[0].message.content
             else:
                 raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
         except Exception as e:
+            logger.warning(f"第{attempt+1}次调用失败: {e}")
             if attempt == retries - 1:
                 mark_failure("api")
                 raise RuntimeError(f"模型连续{retries}次调用失败")
@@ -430,89 +312,85 @@ def call_bailian(messages: List[Dict]) -> str:
             delay *= 2
     raise RuntimeError("未知错误")
 
-
 def export_txt(messages):
-    return "\n\n".join([f"{'用户' if m['role']=='user' else '助手'}：{m.get('content', '')}" for m in messages])
-
-
-# ================= 启动初始化 =================
-
-def init_session_on_startup():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.history_loaded = False
-        st.session_state.session_id = ""
-
-    if not st.session_state.messages and not st.session_state.history_loaded:
-        # 1. 从 latest_session.json 获取最新 Session ID
-        session_id, ts = get_latest_session_id_from_oss()
-        if session_id:
-            st.session_state.session_id = session_id
-        else:
-            st.session_state.session_id = str(uuid.uuid4())
-
-        # 2. 直接读最近 3 轮
-        msgs = load_session_from_oss(st.session_state.session_id, num_rounds=3)
-        if msgs:
-            for m in msgs:
-                m["timestamp"] = datetime.now(BEIJING_TZ).isoformat()
-                m["session_id"] = st.session_state.session_id
-            st.session_state.messages = msgs
-
+    out = ""
+    for m in messages:
+        role = "用户" if m["role"] == "user" else "助手"
+        out += f"{role}：{m.get('content', '')}\n\n"
+    return out
 
 # ================= UI =================
-
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
-st.markdown("""<style>.stApp { background: #ffffff !important; }.stChatInputContainer { position: sticky !important; bottom: 0 !important; background: #ffffff !important; z-index: 999 !important; border-top: 1px solid #e5e7eb !important; }</style>""", unsafe_allow_html=True)
 
 st.title("📱 智飞投研")
-init_memory_db()
-init_session_on_startup()
 
+init_memory_db()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = get_recent_messages(limit=3)
+if "session_id" not in st.session_state:
+    st.session_state.session_id = get_or_create_session()
 if "generating" not in st.session_state:
     st.session_state.generating = False
-
-if not st.session_state.history_loaded:
-    loading_ph = st.empty()
-    loading_ph.info("⏳ 上文加载中...")
+if "stop" not in st.session_state:
+    st.session_state.stop = False
 
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
 
+# ===== 渲染所有已存在的消息 =====
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m.get("content", ""))
 
-if not st.session_state.history_loaded:
-    st.session_state.history_loaded = True
-    if 'loading_ph' in locals():
-        loading_ph.empty()
-    st.rerun()
-
+# ===== 输入 =====
 user_input = st.chat_input("输入消息...")
 
 if user_input and not st.session_state.generating:
+    st.session_state.stop = False
     st.session_state.generating = True
-    ts = datetime.now(BEIJING_TZ).isoformat()
-    msg = {"role": "user", "content": user_input, "timestamp": ts}
-    st.session_state.messages.append(msg)
+
+    session_id = st.session_state.session_id
+    round_num = len([m for m in st.session_state.messages if m["role"] == "user"]) + 1
+
+    user_msg = {
+        "role": "user",
+        "content": user_input,
+        "timestamp": datetime.now(BEIJING_TZ).isoformat()
+    }
+    st.session_state.messages.append(user_msg)
+
+    # ===== 先 rerun 渲染用户消息 =====
     st.rerun()
 
+# ===== 如果有待处理的用户消息（最后一条是 user，且正在生成） =====
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     session_id = st.session_state.session_id
     round_num = len([m for m in st.session_state.messages if m["role"] == "user"])
     user_msg = st.session_state.messages[-1]
 
+    ctx = st.session_state.messages
+
     try:
         with st.spinner("💭 思考中..."):
-            reply = call_bailian([{"role": m["role"], "content": m["content"]} for m in st.session_state.messages])
+            reply = call_bailian(ctx)
 
-        assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now(BEIJING_TZ).isoformat()}
+        assistant_msg = {
+            "role": "assistant",
+            "content": reply,
+            "timestamp": datetime.now(BEIJING_TZ).isoformat()
+        }
         st.session_state.messages.append(assistant_msg)
 
         messages_dict = {"messages": [user_msg, assistant_msg]}
+        save_to_rds(session_id, round_num, messages_dict, user_msg["timestamp"])
         save_to_sqlite(session_id, round_num, messages_dict, user_msg["timestamp"])
-        write_session_to_oss(session_id, round_num, messages_dict, user_msg["timestamp"])
+        sync_to_oss([{
+            "session_id": session_id,
+            "round_num": round_num,
+            "messages": messages_dict,
+            "ts": user_msg["timestamp"]
+        }])
 
     except Exception as e:
         st.error(f"❌ 错误: {e}")
@@ -520,25 +398,38 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
     st.session_state.generating = False
     st.rerun()
 
+# ---- 生成中的暂停 ----
+if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] != "user":
+    with st.chat_message("assistant"):
+        st.markdown("⏳ 生成中...")
+    if st.button("⏹ 暂停", use_container_width=True):
+        st.session_state.stop = True
+        st.rerun()
+
+# ---- 操作按钮 ----
 if not st.session_state.generating and st.session_state.messages:
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("➕ 新建会话", use_container_width=True):
-            old_sid = st.session_state.session_id
-            if old_sid and st.session_state.messages:
-                trigger_backup_and_restore(old_sid)
-            st.session_state.session_id = str(uuid.uuid4())
-            st.session_state.messages = []
-            st.session_state.generating = False
-            st.session_state.history_loaded = True
-            st.rerun()
-    with col2:
         if st.button("🔄 重新生成", use_container_width=True):
             if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
                 st.session_state.messages.pop()
                 st.session_state.generating = True
+                st.session_state.stop = False
                 st.rerun()
-    with col3:
+    with col2:
         if st.button("📤 导出TXT", use_container_width=True):
             txt = export_txt(st.session_state.messages)
             st.download_button("📥 下载", txt, f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt", "text/plain", key="dl")
+    with col3:
+        if st.button("📤 同步OSS", use_container_width=True):
+            with st.spinner("同步中..."):
+                session_id = st.session_state.session_id
+                round_num = len([m for m in st.session_state.messages if m["role"] == "user"])
+                messages_dict = {"messages": st.session_state.messages[-2:] if len(st.session_state.messages) >= 2 else st.session_state.messages}
+                sync_to_oss([{
+                    "session_id": session_id,
+                    "round_num": round_num,
+                    "messages": messages_dict,
+                    "ts": datetime.now(BEIJING_TZ).isoformat()
+                }])
+                st.success("✅ 同步完成")
