@@ -2,11 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v10（2026-08-04）
-- 基于 V9 全部修复
-- 尾部截断丢消息 → 改用完整行收集
-- URL 编码路径失效 → 改回原始路径
-- 累积摘要无重试 → 加缓存兜底+告警
+智飞投研 · 云端轻量版 v11（2026-08-04）
+- 基于 V10，恢复 V7 稳定的 load_session_from_oss
+- 模型自主从 OSS 恢复上文（call_bailian 告诉路径）
 - 纯 OSS 架构，无 RDS 依赖
 """
 
@@ -176,71 +174,6 @@ def _update_latest_session(session_id: str, ts: str):
         logger.warning(f"更新最新 Session 指针失败: {e}")
 
 
-def load_session_from_oss(session_id: str, num_rounds: int = 3) -> List[Dict]:
-    """V10修复：尾部截断丢消息 → 改为收集完整行后取最后N行"""
-    try:
-        bucket = get_oss_client()
-        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
-        try:
-            meta = bucket.head_object(remote_path)
-            length = meta.content_length
-            read_size = min(length, 20480)
-            start = length - read_size
-            result = oss_get_with_retry(bucket, remote_path, byte_range=(start, length - 1))
-            if result is None:
-                return []
-            content = result.read().decode('utf-8')
-
-            # 拆分行，处理边界
-            lines = content.split('\n')
-            if lines and lines[-1] == '':
-                lines = lines[:-1]
-
-            # 如果 start>0，第一条可能不完整，丢弃
-            if start > 0 and lines:
-                first_line = lines[0].strip()
-                if first_line and not first_line.endswith('}'):
-                    lines = lines[1:]
-
-            # 收集完整的 JSON 行
-            valid_lines = []
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                    if item.get("round_num", 0) == 0:
-                        continue
-                    valid_lines.append(line)
-                except:
-                    continue
-
-            # 取最后 num_rounds*2 个完整行
-            all_msgs = []
-            for line in valid_lines[-(num_rounds * 2):]:
-                try:
-                    item = json.loads(line)
-                    msgs_data = item.get("messages", {})
-                    if isinstance(msgs_data, str):
-                        msgs_data = json.loads(msgs_data)
-                    actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
-                    for msg in actual_msgs:
-                        all_msgs.append({
-                            "role": msg.get("role"),
-                            "content": msg.get("content")
-                        })
-                except:
-                    continue
-
-            return all_msgs
-
-        except oss2.exceptions.NoSuchKey:
-            return []
-    except Exception as e:
-        logger.warning(f"读取 Session {session_id} 失败: {e}")
-        return []
-
-
 def get_latest_session_id_from_oss() -> tuple:
     try:
         bucket = get_oss_client()
@@ -253,6 +186,50 @@ def get_latest_session_id_from_oss() -> tuple:
     except Exception as e:
         logger.warning(f"读取最新 Session 失败: {e}")
         return "", ""
+
+
+# V11 核心：load_session_from_oss 恢复 V7 稳定版
+def load_session_from_oss(session_id: str, num_rounds: int = 3) -> List[Dict]:
+    """从 {session_id}.jsonl 读取最近 N 轮对话（V7 稳定版）"""
+    try:
+        bucket = get_oss_client()
+        remote_path = OSS_PREFIX + f"{session_id}.jsonl"
+        try:
+            meta = bucket.head_object(remote_path)
+            length = meta.content_length
+            read_size = min(length, 20480)
+            start = length - read_size
+            result = bucket.get_object(remote_path, byte_range=(start, length - 1))
+            content = result.read().decode('utf-8')
+            if start > 0:
+                content = content[content.find('\n') + 1:]
+
+            all_msgs = []
+            for line in content.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                    if item.get("round_num", 0) == 0:
+                        continue
+                    msgs_data = item.get("messages", {})
+                    if isinstance(msgs_data, str):
+                        msgs_data = json.loads(msgs_data)
+                    actual_msgs = msgs_data.get("messages", []) if isinstance(msgs_data, dict) else []
+                    for msg in actual_msgs:
+                        all_msgs.append({
+                            "role": msg.get("role"),
+                            "content": msg.get("content")
+                        })
+                except:
+                    continue
+
+            return all_msgs[-(num_rounds * 2):] if len(all_msgs) > num_rounds * 2 else all_msgs
+        except oss2.exceptions.NoSuchKey:
+            return []
+    except Exception as e:
+        logger.warning(f"读取 Session {session_id} 失败: {e}")
+        return []
 
 
 def get_cumulative_summary_from_oss() -> str:
@@ -391,7 +368,6 @@ def load_full_session_from_oss(session_id: str) -> List[Dict]:
 
 
 def trigger_backup_and_restore(old_session_id: str):
-    """V10修复：累积摘要无重试 → 加缓存兜底+告警"""
     if not old_session_id:
         logger.warning("⚠️ 后加载跳过：old_session_id 为空")
         return
@@ -484,7 +460,6 @@ def call_bailian(messages: List[Dict]) -> str:
     if total_tokens > MAX_INPUT_TOKENS:
         raise RuntimeError(f"输入过长（~{total_tokens} tokens），请缩短消息后重试")
 
-    # V10修复：不编码，直接传原始路径
     oss_instruction = f"""
 你是智飞投研助手。当前时间：{current_time}
 
