@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v11（2026-08-04）
-- 基于 V10，恢复 V7 稳定的 load_session_from_oss
-- 新增 get_valid_latest_session：指针失效时自动扫描 OSS 目录兜底
-- 模型自主从 OSS 恢复上文（call_bailian 告诉路径）
-- 纯 OSS 架构，无 RDS 依赖
+智飞投研 · 云端轻量版 v7.1（2026-08-04）
+- 基于 V7 原版，只加 5 个安全网，原代码一个字不动
+- 1. OSS 读取重试 oss_get_with_retry()
+- 2. 有效 Session 扫描兜底 get_valid_latest_session()
+- 3. Token 自动截断（16000，不报错）
+- 4. 后加载缓存兜底 trigger_backup_and_restore()
+- 5. 启动初始化替换 get_valid_latest_session
+- call_bailian 保持 V7 原版
 """
 
 import os
@@ -16,9 +19,8 @@ import time
 import uuid
 import logging
 import sqlite3
-import threading
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 import streamlit as st
 import dashscope
@@ -52,8 +54,7 @@ if not DASHSCOPE_API_KEY:
 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEMORY_DB_PATH = os.path.join(BASE_DIR, "chat_memory.db")
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
@@ -64,28 +65,26 @@ OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_k
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ================= 熔断（线程安全） =================
+
+# ================= 熔断 =================
 _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
-_FAIL_LOCK = threading.Lock()
 _MODEL_HEALTHY = True
 _MAX_CONSECUTIVE_FAILURES = {"network": 5, "api": 3, "model": 2}
 
 
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
-    with _FAIL_LOCK:
-        _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
-        _MODEL_HEALTHY = True
+    _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
+    _MODEL_HEALTHY = True
 
 
 def mark_failure(error_type: str):
     global _FAIL_COUNTER, _MODEL_HEALTHY
     if error_type not in _FAIL_COUNTER:
         return
-    with _FAIL_LOCK:
-        _FAIL_COUNTER[error_type] += 1
-        if error_type == "model" and _FAIL_COUNTER["model"] >= _MAX_CONSECUTIVE_FAILURES["model"]:
-            _MODEL_HEALTHY = False
+    _FAIL_COUNTER[error_type] += 1
+    if error_type == "model" and _FAIL_COUNTER["model"] >= _MAX_CONSECUTIVE_FAILURES["model"]:
+        _MODEL_HEALTHY = False
 
 
 def is_model_healthy() -> bool:
@@ -104,8 +103,7 @@ def get_oss_client():
     client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
     req.set_RoleArn("acs:ram::1045482798819953:role/STS-OSS-Read")
-    session_name = f"web-{uuid.uuid4().hex[:8]}"
-    req.set_RoleSessionName(session_name)
+    req.set_RoleSessionName("web-oss-session")
     req.set_DurationSeconds(900)
     resp = client.do_action_with_exception(req)
     creds = json.loads(resp)["Credentials"]
@@ -113,6 +111,7 @@ def get_oss_client():
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
 
+# ================= 新增 1：OSS 读取重试 =================
 def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
     for attempt in range(max_retry):
         try:
@@ -125,9 +124,39 @@ def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
     return None
 
 
-# ================= 核心读写 =================
+# ================= 新增 2：有效 Session 扫描兜底 =================
+def get_valid_latest_session() -> tuple:
+    """获取有效的最新 Session：优先读 latest_session.json，失败则扫描 OSS 目录兜底"""
+    sid, ts = get_latest_session_id_from_oss()
+    if sid:
+        msgs = load_session_from_oss(sid, num_rounds=1)
+        if msgs:
+            return sid, ts
+        logger.warning(f"⚠️ latest_session.json 指向 {sid}，但该 session 无数据，回退扫描 OSS 目录")
 
-def _ensure_appendable_with_lock(bucket, remote_path: str) -> int:
+    try:
+        bucket = get_oss_client()
+        latest_file = None
+        latest_time = 0
+        for obj in oss2.ObjectIterator(bucket, prefix=OSS_PREFIX):
+            if obj.key.endswith('.jsonl') and not obj.key.endswith('.tmp_append'):
+                if obj.last_modified > latest_time:
+                    latest_time = obj.last_modified
+                    latest_file = obj.key
+        if latest_file:
+            sid = latest_file.split('/')[-1].replace('.jsonl', '')
+            # 空 Session 不改，直接返回（用户看到空白但不会崩）
+            logger.info(f"✅ 扫描 OSS 目录找到 session: {sid}")
+            return sid, datetime.fromtimestamp(latest_time).isoformat()
+    except Exception as e:
+        logger.warning(f"扫描 OSS 目录失败: {e}")
+
+    return "", ""
+
+
+# ================= V7 原版代码（一字不动） =================
+
+def _ensure_appendable(bucket, remote_path: str) -> int:
     try:
         meta = bucket.head_object(remote_path)
         if meta.headers.get('x-oss-object-type') == 'Appendable':
@@ -135,7 +164,8 @@ def _ensure_appendable_with_lock(bucket, remote_path: str) -> int:
         else:
             result = bucket.get_object(remote_path)
             content = result.read()
-            bucket.put_object(remote_path, content)
+            bucket.delete_object(remote_path)
+            bucket.append_object(remote_path, 0, content)
             return len(content)
     except oss2.exceptions.NoSuchKey:
         return 0
@@ -145,7 +175,7 @@ def write_session_to_oss(session_id: str, round_num: int, round_messages: dict, 
     try:
         bucket = get_oss_client()
         remote_path = OSS_PREFIX + f"{session_id}.jsonl"
-        pos = _ensure_appendable_with_lock(bucket, remote_path)
+        pos = _ensure_appendable(bucket, remote_path)
 
         content = json.dumps({
             "session_id": session_id,
@@ -175,55 +205,7 @@ def _update_latest_session(session_id: str, ts: str):
         logger.warning(f"更新最新 Session 指针失败: {e}")
 
 
-def get_latest_session_id_from_oss() -> tuple:
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + "latest_session.json"
-        result = oss_get_with_retry(bucket, remote)
-        if result is None:
-            return "", ""
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("session_id", ""), data.get("ts", "")
-    except Exception as e:
-        logger.warning(f"读取最新 Session 失败: {e}")
-        return "", ""
-
-
-# V11 新增：指针失效时自动扫描 OSS 目录兜底
-def get_valid_latest_session() -> tuple:
-    """获取有效的最新 Session：优先读 latest_session.json，失败则扫描 OSS 目录"""
-    # 1. 优先读指针文件
-    sid, ts = get_latest_session_id_from_oss()
-    if sid:
-        # 验证这个 session 是否有数据
-        msgs = load_session_from_oss(sid, num_rounds=1)
-        if msgs:
-            return sid, ts
-        logger.warning(f"⚠️ latest_session.json 指向 {sid}，但该 session 无数据，回退扫描 OSS 目录")
-
-    # 2. 指针文件无效，扫描 OSS 目录找最新的有数据的 session
-    try:
-        bucket = get_oss_client()
-        latest_file = None
-        latest_time = 0
-        for obj in oss2.ObjectIterator(bucket, prefix=OSS_PREFIX):
-            if obj.key.endswith('.jsonl') and not obj.key.endswith('.tmp_append'):
-                if obj.last_modified > latest_time:
-                    latest_time = obj.last_modified
-                    latest_file = obj.key
-        if latest_file:
-            sid = latest_file.split('/')[-1].replace('.jsonl', '')
-            logger.info(f"✅ 扫描 OSS 目录找到有效 session: {sid}")
-            return sid, datetime.fromtimestamp(latest_time).isoformat()
-    except Exception as e:
-        logger.warning(f"扫描 OSS 目录失败: {e}")
-
-    return "", ""
-
-
-# V11 核心：load_session_from_oss 恢复 V7 稳定版
 def load_session_from_oss(session_id: str, num_rounds: int = 3) -> List[Dict]:
-    """从 {session_id}.jsonl 读取最近 N 轮对话（V7 稳定版）"""
     try:
         bucket = get_oss_client()
         remote_path = OSS_PREFIX + f"{session_id}.jsonl"
@@ -265,21 +247,28 @@ def load_session_from_oss(session_id: str, num_rounds: int = 3) -> List[Dict]:
         return []
 
 
+def get_latest_session_id_from_oss() -> tuple:
+    try:
+        bucket = get_oss_client()
+        remote = OSS_PREFIX + "latest_session.json"
+        result = bucket.get_object(remote)
+        data = json.loads(result.read().decode('utf-8'))
+        return data.get("session_id", ""), data.get("ts", "")
+    except Exception:
+        return "", ""
+
+
 def get_cumulative_summary_from_oss() -> str:
     try:
         bucket = get_oss_client()
         remote = OSS_PREFIX + "chat_summary_window.json"
-        result = oss_get_with_retry(bucket, remote)
-        if result is None:
-            return ""
+        result = bucket.get_object(remote)
         data = json.loads(result.read().decode('utf-8'))
         return data.get("cumulative", "")
     except Exception as e:
         logger.debug(f"读取累积摘要失败: {e}")
         return ""
 
-
-# ================= 后加载 =================
 
 SESSION_WINDOW_SIZE = 12
 
@@ -288,9 +277,7 @@ def _read_summary_window():
     try:
         bucket = get_oss_client()
         remote = OSS_PREFIX + "chat_summary_window.json"
-        result = oss_get_with_retry(bucket, remote)
-        if result is None:
-            return {"window": [], "cumulative": ""}
+        result = bucket.get_object(remote)
         data = json.loads(result.read().decode('utf-8'))
         data.setdefault("window", [])
         data.setdefault("cumulative", "")
@@ -313,13 +300,7 @@ def merge_cumulative(previous: str, new_summary: str) -> str:
     if not previous:
         return new_summary
     try:
-        combined = f"{previous}\n\n---\n\n{new_summary}"
-        if len(combined) > 2000:
-            combined_bytes = combined.encode('utf-8')[:2000]
-            while combined_bytes and (combined_bytes[-1] & 0xC0) == 0x80:
-                combined_bytes = combined_bytes[:-1]
-            combined = combined_bytes.decode('utf-8', errors='ignore')
-        prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{combined}"
+        prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{previous}\n---\n{new_summary}"
         dashscope.api_key = DASHSCOPE_API_KEY
         resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
         if resp.status_code == HTTPStatus.OK and resp.output.choices:
@@ -333,13 +314,7 @@ def generate_summary(messages: List[Dict]) -> str:
     if not messages:
         return ""
     try:
-        content = json.dumps(messages, ensure_ascii=False)
-        if len(content) > 5000:
-            content_bytes = content.encode('utf-8')[:5000]
-            while content_bytes and (content_bytes[-1] & 0xC0) == 0x80:
-                content_bytes = content_bytes[:-1]
-            content = content_bytes.decode('utf-8', errors='ignore')
-        prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{content}"
+        prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{json.dumps(messages, ensure_ascii=False)[:5000]}"
         dashscope.api_key = DASHSCOPE_API_KEY
         resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
         if resp.status_code == HTTPStatus.OK and resp.output.choices:
@@ -354,28 +329,8 @@ def load_full_session_from_oss(session_id: str) -> List[Dict]:
         bucket = get_oss_client()
         remote_path = OSS_PREFIX + f"{session_id}.jsonl"
         try:
-            meta = bucket.head_object(remote_path)
-            file_size = meta.content_length
-            if file_size > 10 * 1024 * 1024:
-                logger.warning(f"⚠️ Session {session_id} 文件过大 ({file_size} bytes)，仅读取尾部 1MB")
-                read_size = min(file_size, 1024 * 1024)
-                start = file_size - read_size
-                result = oss_get_with_retry(bucket, remote_path, byte_range=(start, file_size - 1))
-                if result is None:
-                    return []
-                content = result.read().decode('utf-8')
-                if start > 0:
-                    newline_pos = content.find('\n')
-                    if newline_pos >= 0:
-                        content = content[newline_pos + 1:]
-                    else:
-                        return []
-            else:
-                result = oss_get_with_retry(bucket, remote_path)
-                if result is None:
-                    return []
-                content = result.read().decode('utf-8')
-
+            resp = bucket.get_object(remote_path)
+            content = resp.read().decode('utf-8')
             all_msgs = []
             for line in content.strip().split('\n'):
                 if not line.strip():
@@ -400,6 +355,7 @@ def load_full_session_from_oss(session_id: str) -> List[Dict]:
         return []
 
 
+# ================= 新增 4：后加载缓存兜底 =================
 def trigger_backup_and_restore(old_session_id: str):
     if not old_session_id:
         logger.warning("⚠️ 后加载跳过：old_session_id 为空")
@@ -424,8 +380,6 @@ def trigger_backup_and_restore(old_session_id: str):
         if "cached_summary" in st.session_state and st.session_state.cached_summary:
             cumulative = st.session_state.cached_summary
             logger.info(f"✅ 使用缓存摘要替代空窗口")
-        else:
-            logger.info(f"🆕 无历史摘要，以当前摘要作为初始累积摘要")
 
     existing_sids = [w.get("session_id") for w in window]
     if old_session_id not in existing_sids:
@@ -440,8 +394,6 @@ def trigger_backup_and_restore(old_session_id: str):
         _save_summary_window(window, cumulative)
         st.session_state.cached_summary = cumulative
         logger.info(f"✅ 后加载完成：{old_session_id} 已固化")
-    else:
-        logger.info(f"ℹ️ 后加载跳过：{old_session_id} 已存在摘要")
 
 
 # ================= SQLite 兜底 =================
@@ -466,50 +418,40 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH)
         cursor = conn.cursor()
-        messages_json = json.dumps(messages, ensure_ascii=False)
         cursor.execute("INSERT INTO chat_memory_new (session_id, round_num, messages, ts) VALUES (?, ?, ?, ?)",
-                       (session_id, round_num, messages_json, ts))
+                       (session_id, round_num, json.dumps(messages, ensure_ascii=False), ts))
         conn.commit()
         conn.close()
     except:
         pass
 
 
-# ================= 模型调用 =================
-
-MAX_INPUT_TOKENS = 8000
-
-
+# ================= V7 原版 call_bailian（一字不动） =================
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
 
+    sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
+
     session_id = st.session_state.get("session_id", "")
-    current_time = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')
-    prefix_raw = OSS_PREFIX.rstrip('/')
 
-    total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
-    if total_tokens > MAX_INPUT_TOKENS:
-        raise RuntimeError(f"输入过长（~{total_tokens} tokens），请缩短消息后重试")
+    cumulative = get_cumulative_summary_from_oss()
+    if cumulative:
+        sys_parts.append(f"\n【历史对话摘要】\n{cumulative}")
 
-    oss_instruction = f"""
-你是智飞投研助手。当前时间：{current_time}
+    if session_id:
+        recent = load_session_from_oss(session_id, num_rounds=5)
+        if recent:
+            lines = []
+            for m in recent:
+                role = "用户" if m.get("role") == "user" else "助手"
+                content = m.get("content", "")[:300]
+                lines.append(f"{role}：{content}")
+            if lines:
+                sys_parts.append("\n【最近对话（用于接续上文）】\n" + "\n".join(lines))
 
-你有能力通过百炼的 getOSSFile 工具直接读取 OSS 上的文件。
-当前会话的上下文存储在以下路径：
-- 当前 Session 对话文件：{prefix_raw}/{session_id}.jsonl
-- 全局摘要文件：{prefix_raw}/chat_summary_window.json
-
-请按以下步骤操作：
-1. 使用 getOSSFile 工具读取全局摘要文件，获取历史对话摘要。
-2. 使用 getOSSFile 工具读取当前 Session 对话文件的尾部内容，获取最近几轮对话。
-3. 基于读取到的上下文，回答用户的问题。
-
-规则：直接输出结论+关键数据+风险提示。不展示工具调用过程。
-"""
-
-    sys_p = oss_instruction
+    sys_p = "\n".join(sys_parts)
     full_msgs = [{"role": "system", "content": sys_p}] + messages
 
     retries, delay = 3, 2
@@ -534,8 +476,7 @@ def export_txt(messages):
     return "\n\n".join([f"{'用户' if m['role']=='user' else '助手'}：{m.get('content', '')}" for m in messages])
 
 
-# ================= 启动初始化 =================
-
+# ================= 新增 5：启动初始化替换 =================
 def init_session_on_startup():
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -544,7 +485,7 @@ def init_session_on_startup():
         st.session_state.cached_summary = ""
 
     if not st.session_state.messages and not st.session_state.history_loaded:
-        # V11 修复：使用 get_valid_latest_session，指针失效时自动扫描 OSS 目录兜底
+        # 替换：用 get_valid_latest_session 替代 get_latest_session_id_from_oss
         session_id, ts = get_valid_latest_session()
         if session_id:
             st.session_state.session_id = session_id
@@ -558,6 +499,28 @@ def init_session_on_startup():
                 m["timestamp"] = datetime.now(BEIJING_TZ).isoformat()
                 m["session_id"] = st.session_state.session_id
             st.session_state.messages = msgs
+
+
+# ================= 新增 3：Token 自动截断（插入 call_bailian 入口） =================
+def call_bailian_with_token_check(messages: List[Dict]) -> str:
+    """替换 call_bailian 的入口，自动截断超长输入"""
+    MAX_INPUT_TOKENS = 16000
+
+    total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
+    if total_tokens > MAX_INPUT_TOKENS:
+        logger.warning(f"⚠️ 输入超长 ({total_tokens} tokens)，自动截断最近消息")
+        trimmed = []
+        running_tokens = 0
+        for m in reversed(messages):
+            t = estimate_tokens(str(m.get("content", "")))
+            if running_tokens + t > MAX_INPUT_TOKENS:
+                break
+            trimmed.insert(0, m)
+            running_tokens += t
+        messages = trimmed
+        logger.info(f"✅ 截断后 {len(messages)} 条消息")
+
+    return call_bailian(messages)
 
 
 # ================= UI =================
@@ -605,7 +568,8 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
 
     try:
         with st.spinner("💭 思考中..."):
-            reply = call_bailian([{"role": m["role"], "content": m["content"]} for m in st.session_state.messages])
+            # 使用带 token 截断的调用
+            reply = call_bailian_with_token_check([{"role": m["role"], "content": m["content"]} for m in st.session_state.messages])
 
         assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now(BEIJING_TZ).isoformat()}
         st.session_state.messages.append(assistant_msg)
@@ -614,10 +578,8 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
         save_to_sqlite(session_id, round_num, messages_dict, user_msg["timestamp"])
         write_session_to_oss(session_id, round_num, messages_dict, user_msg["timestamp"])
 
-    except RuntimeError as e:
-        st.error(f"❌ {str(e)}")
     except Exception as e:
-        st.error(f"❌ 错误: {str(e)}")
+        st.error(f"❌ 错误: {e}")
 
     st.session_state.generating = False
     st.rerun()
