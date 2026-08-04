@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v7.1（2026-08-04）
-- 基于 V7 原版，只加 5 个安全网，原代码一个字不动
-- 1. OSS 读取重试 oss_get_with_retry()
-- 2. 有效 Session 扫描兜底 get_valid_latest_session()
-- 3. Token 自动截断（16000，不报错）
-- 4. 后加载缓存兜底 trigger_backup_and_restore()
-- 5. 启动初始化替换 get_valid_latest_session
-- call_bailian 保持 V7 原版
+智飞投研 · 云端轻量版 v7.3（2026-08-04）
+- 基于 V7.2，修复 5 个缺陷
+- 1. trigger_backup_and_restore：_read_summary_window 失败时不再覆盖 OSS 数据
+- 2. call_bailian_with_token_check：预留系统提示词 token 余量（2000 tokens）
+- 3. call_bailian：区分网络错误 vs API 错误，正确分类 mark_failure
+- 4. generate_summary / merge_cumulative：增加重试机制
+- 5. export_txt：修复 content 为 None 时的字符串拼接
+- 6. 下载按钮 key 改为动态避免重复
 """
 
 import os
@@ -98,6 +98,16 @@ def estimate_tokens(text: str) -> int:
     return int(ch / 1.5 + (len(text) - ch) / 4)
 
 
+def _classify_error(e: Exception) -> str:
+    """V7.3 新增：根据异常类型区分 network / api / model"""
+    err_str = str(e).lower()
+    if any(kw in err_str for kw in ["timeout", "connection", "network", "resolve", "refused"]):
+        return "network"
+    if any(kw in err_str for kw in ["rate", "quota", "throttle", "limit", "429"]):
+        return "api"
+    return "model"
+
+
 # ================= OSS 客户端 =================
 def get_oss_client():
     client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
@@ -111,7 +121,7 @@ def get_oss_client():
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
 
 
-# ================= 新增 1：OSS 读取重试 =================
+# ================= 1：OSS 读取重试 =================
 def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
     for attempt in range(max_retry):
         try:
@@ -124,18 +134,31 @@ def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
     return None
 
 
-# ================= 新增 2：有效 Session 扫描兜底 =================
+# ================= 2：有效 Session 扫描兜底（V7.2 修复：删掉多余验证） =================
 def get_valid_latest_session() -> tuple:
     """获取有效的最新 Session：优先读 latest_session.json，失败则扫描 OSS 目录兜底"""
-    sid, ts = get_latest_session_id_from_oss()
-    if sid:
-        msgs = load_session_from_oss(sid, num_rounds=1)
-        if msgs:
-            return sid, ts
-        logger.warning(f"⚠️ latest_session.json 指向 {sid}，但该 session 无数据，回退扫描 OSS 目录")
-
     try:
         bucket = get_oss_client()
+    except Exception as e:
+        logger.warning(f"获取 OSS client 失败: {e}")
+        return "", ""
+
+    # 1. 优先读指针文件（直接信任，不验证数据）
+    try:
+        remote = OSS_PREFIX + "latest_session.json"
+        result = oss_get_with_retry(bucket, remote)
+        if result is not None:
+            data = json.loads(result.read().decode('utf-8'))
+            sid = data.get("session_id", "")
+            ts = data.get("ts", "")
+            if sid:
+                logger.info(f"✅ 从 latest_session.json 读取 session: {sid}")
+                return sid, ts
+    except Exception as e:
+        logger.warning(f"读取 latest_session.json 失败: {e}")
+
+    # 2. 指针文件不存在或读取失败，扫描 OSS 目录找最新的 .jsonl
+    try:
         latest_file = None
         latest_time = 0
         for obj in oss2.ObjectIterator(bucket, prefix=OSS_PREFIX):
@@ -145,7 +168,6 @@ def get_valid_latest_session() -> tuple:
                     latest_file = obj.key
         if latest_file:
             sid = latest_file.split('/')[-1].replace('.jsonl', '')
-            # 空 Session 不改，直接返回（用户看到空白但不会崩）
             logger.info(f"✅ 扫描 OSS 目录找到 session: {sid}")
             return sid, datetime.fromtimestamp(latest_time).isoformat()
     except Exception as e:
@@ -154,7 +176,7 @@ def get_valid_latest_session() -> tuple:
     return "", ""
 
 
-# ================= V7 原版代码（一字不动） =================
+# ================= V7 原版代码 =================
 
 def _ensure_appendable(bucket, remote_path: str) -> int:
     try:
@@ -274,6 +296,7 @@ SESSION_WINDOW_SIZE = 12
 
 
 def _read_summary_window():
+    """V7.3 修复：返回 (data, success) 元组，success=False 表示读取失败"""
     try:
         bucket = get_oss_client()
         remote = OSS_PREFIX + "chat_summary_window.json"
@@ -281,9 +304,12 @@ def _read_summary_window():
         data = json.loads(result.read().decode('utf-8'))
         data.setdefault("window", [])
         data.setdefault("cumulative", "")
-        return data
-    except:
-        return {"window": [], "cumulative": ""}
+        return data, True
+    except oss2.exceptions.NoSuchKey:
+        return {"window": [], "cumulative": ""}, True
+    except Exception as e:
+        logger.warning(f"读取摘要窗口失败: {e}")
+        return {"window": [], "cumulative": ""}, False
 
 
 def _save_summary_window(window, cumulative):
@@ -297,30 +323,56 @@ def _save_summary_window(window, cumulative):
 
 
 def merge_cumulative(previous: str, new_summary: str) -> str:
+    """V7.3 修复：增加重试机制"""
     if not previous:
         return new_summary
-    try:
-        prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{previous}\n---\n{new_summary}"
-        dashscope.api_key = DASHSCOPE_API_KEY
-        resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-        if resp.status_code == HTTPStatus.OK and resp.output.choices:
-            return resp.output.choices[0].message.content
-    except:
-        pass
+    retries, delay = 2, 1
+    for attempt in range(retries):
+        try:
+            prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{previous}\n---\n{new_summary}"
+            dashscope.api_key = DASHSCOPE_API_KEY
+            resp = dashscope.Generation.call(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                result_format="message"
+            )
+            if resp.status_code == HTTPStatus.OK and resp.output.choices:
+                return resp.output.choices[0].message.content
+            else:
+                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
+        except Exception as e:
+            if attempt == retries - 1:
+                logger.warning(f"merge_cumulative 失败，回退到 previous: {e}")
+                return previous
+            time.sleep(delay)
+            delay *= 2
     return previous
 
 
 def generate_summary(messages: List[Dict]) -> str:
+    """V7.3 修复：增加重试机制"""
     if not messages:
         return ""
-    try:
-        prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{json.dumps(messages, ensure_ascii=False)[:5000]}"
-        dashscope.api_key = DASHSCOPE_API_KEY
-        resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-        if resp.status_code == HTTPStatus.OK and resp.output.choices:
-            return resp.output.choices[0].message.content
-    except:
-        pass
+    retries, delay = 2, 1
+    for attempt in range(retries):
+        try:
+            prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{json.dumps(messages, ensure_ascii=False)[:5000]}"
+            dashscope.api_key = DASHSCOPE_API_KEY
+            resp = dashscope.Generation.call(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                result_format="message"
+            )
+            if resp.status_code == HTTPStatus.OK and resp.output.choices:
+                return resp.output.choices[0].message.content
+            else:
+                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
+        except Exception as e:
+            if attempt == retries - 1:
+                logger.warning(f"generate_summary 失败: {e}")
+                return ""
+            time.sleep(delay)
+            delay *= 2
     return ""
 
 
@@ -355,8 +407,9 @@ def load_full_session_from_oss(session_id: str) -> List[Dict]:
         return []
 
 
-# ================= 新增 4：后加载缓存兜底 =================
+# ================= 4：后加载缓存兜底（V7.3 修复） =================
 def trigger_backup_and_restore(old_session_id: str):
+    """V7.3 修复：_read_summary_window 失败时不覆盖 OSS 数据"""
     if not old_session_id:
         logger.warning("⚠️ 后加载跳过：old_session_id 为空")
         return
@@ -371,12 +424,23 @@ def trigger_backup_and_restore(old_session_id: str):
         logger.warning(f"⚠️ 后加载跳过：摘要生成失败")
         return
 
-    data = _read_summary_window()
+    data, read_ok = _read_summary_window()
     window = data.get("window", [])
     cumulative = data.get("cumulative", "")
 
+    if not read_ok:
+        # V7.3：读取失败，不覆盖 OSS，仅用 session_state 缓存兜底
+        logger.warning("⚠️ 摘要窗口读取失败，跳过 OSS 写入，仅保留内存缓存")
+        if "cached_summary" in st.session_state and st.session_state.cached_summary:
+            st.session_state.cached_summary = merge_cumulative(
+                st.session_state.cached_summary, summary
+            )
+        else:
+            st.session_state.cached_summary = summary
+        return
+
+    # 读取成功，正常处理
     if not window and not cumulative:
-        logger.warning("⚠️ 摘要窗口读取失败，尝试保留旧缓存")
         if "cached_summary" in st.session_state and st.session_state.cached_summary:
             cumulative = st.session_state.cached_summary
             logger.info(f"✅ 使用缓存摘要替代空窗口")
@@ -426,7 +490,7 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
         pass
 
 
-# ================= V7 原版 call_bailian（一字不动） =================
+# ================= V7.3 修复：call_bailian（区分错误类型） =================
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
@@ -457,26 +521,36 @@ def call_bailian(messages: List[Dict]) -> str:
     retries, delay = 3, 2
     for attempt in range(retries):
         try:
-            resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
+            resp = dashscope.Generation.call(
+                model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False
+            )
             if resp.status_code == HTTPStatus.OK and resp.output.choices:
                 reset_health_status()
                 return resp.output.choices[0].message.content
             else:
                 raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
         except Exception as e:
+            err_type = _classify_error(e)
             if attempt == retries - 1:
-                mark_failure("api")
-                raise RuntimeError(f"模型连续{retries}次调用失败")
+                mark_failure(err_type)
+                raise RuntimeError(f"模型连续{retries}次调用失败: {e}")
+            logger.warning(f"call_bailian 重试 {attempt+1}/{retries} [{err_type}]: {e}")
             time.sleep(delay)
             delay *= 2
     raise RuntimeError("未知错误")
 
 
 def export_txt(messages):
-    return "\n\n".join([f"{'用户' if m['role']=='user' else '助手'}：{m.get('content', '')}" for m in messages])
+    """V7.3 修复：处理 content 为 None 的情况"""
+    lines = []
+    for m in messages:
+        role = "用户" if m.get("role") == "user" else "助手"
+        content = m.get("content") or ""
+        lines.append(f"{role}：{content}")
+    return "\n\n".join(lines)
 
 
-# ================= 新增 5：启动初始化替换 =================
+# ================= 5：启动初始化替换 =================
 def init_session_on_startup():
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -485,7 +559,6 @@ def init_session_on_startup():
         st.session_state.cached_summary = ""
 
     if not st.session_state.messages and not st.session_state.history_loaded:
-        # 替换：用 get_valid_latest_session 替代 get_latest_session_id_from_oss
         session_id, ts = get_valid_latest_session()
         if session_id:
             st.session_state.session_id = session_id
@@ -501,24 +574,26 @@ def init_session_on_startup():
             st.session_state.messages = msgs
 
 
-# ================= 新增 3：Token 自动截断（插入 call_bailian 入口） =================
+# ================= 3：Token 自动截断（V7.3 修复：预留系统提示词余量） =================
 def call_bailian_with_token_check(messages: List[Dict]) -> str:
-    """替换 call_bailian 的入口，自动截断超长输入"""
+    """V7.3 修复：预留 2500 tokens 给系统提示词（时间+累积摘要+最近对话）"""
     MAX_INPUT_TOKENS = 16000
+    SYSTEM_PROMPT_RESERVE = 2500
 
     total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
-    if total_tokens > MAX_INPUT_TOKENS:
+    if total_tokens > MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE:
         logger.warning(f"⚠️ 输入超长 ({total_tokens} tokens)，自动截断最近消息")
         trimmed = []
         running_tokens = 0
+        limit = MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE
         for m in reversed(messages):
             t = estimate_tokens(str(m.get("content", "")))
-            if running_tokens + t > MAX_INPUT_TOKENS:
+            if running_tokens + t > limit:
                 break
             trimmed.insert(0, m)
             running_tokens += t
         messages = trimmed
-        logger.info(f"✅ 截断后 {len(messages)} 条消息")
+        logger.info(f"✅ 截断后 {len(messages)} 条消息，~{running_tokens} tokens")
 
     return call_bailian(messages)
 
@@ -544,7 +619,7 @@ st.caption(f"{total_rounds} 轮对话")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
-        st.markdown(m.get("content", ""))
+        st.markdown(str(m.get("content") or ""))
 
 if not st.session_state.history_loaded:
     st.session_state.history_loaded = True
@@ -568,8 +643,9 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
 
     try:
         with st.spinner("💭 思考中..."):
-            # 使用带 token 截断的调用
-            reply = call_bailian_with_token_check([{"role": m["role"], "content": m["content"]} for m in st.session_state.messages])
+            reply = call_bailian_with_token_check(
+                [{"role": m["role"], "content": str(m.get("content") or "")} for m in st.session_state.messages]
+            )
 
         assistant_msg = {"role": "assistant", "content": reply, "timestamp": datetime.now(BEIJING_TZ).isoformat()}
         st.session_state.messages.append(assistant_msg)
@@ -605,4 +681,9 @@ if not st.session_state.generating and st.session_state.messages:
     with col3:
         if st.button("📤 导出TXT", use_container_width=True):
             txt = export_txt(st.session_state.messages)
-            st.download_button("📥 下载", txt, f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt", "text/plain", key="dl")
+            download_key = f"dl_{datetime.now(BEIJING_TZ).strftime('%Y%m%d%H%M%S')}"
+            st.download_button(
+                "📥 下载", txt,
+                f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt",
+                "text/plain", key=download_key
+            )
