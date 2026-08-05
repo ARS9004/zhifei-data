@@ -72,9 +72,7 @@ MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 RDS_HOST = get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com")
 RDS_PORT = int(get_secret_or_env("RDS_PORT", "rds.port", 3306))
 RDS_USER = get_secret_or_env("RDS_USER", "rds.user", "zhuanz1")
-RDS_PASSWORD = get_secret_or_env("RDS_PASSWORD", "rds.password")
-if not RDS_PASSWORD:
-    raise RuntimeError("⛔ 请配置 RDS_PASSWORD")
+RDS_PASSWORD = get_secret_or_env("RDS_PASSWORD", "rds.password", "zhuanz1_2026")
 RDS_DATABASE = get_secret_or_env("RDS_DATABASE", "rds.database", "stock_db")
 RDS_CHAT_TABLE = "chat_memory"
  
