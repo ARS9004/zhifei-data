@@ -685,22 +685,13 @@ if "generating" not in st.session_state:
     st.session_state.generating = False
 if "stop" not in st.session_state:
     st.session_state.stop = False
-if "render_offset" not in st.session_state:
-    st.session_state.render_offset = 0
  
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
  
-RENDER_ROUNDS = 30
-total_msgs = len(st.session_state.messages)
-render_count = (st.session_state.get("render_offset", 0) + RENDER_ROUNDS) * 2
-render_start = max(0, total_msgs - render_count)
-render_msgs = st.session_state.messages[render_start:]
- 
-if render_start > 0:
-    if st.button("⬆️ 加载更早的对话", use_container_width=True):
-        st.session_state.render_offset = st.session_state.get("render_offset", 0) + RENDER_ROUNDS
-        st.rerun()
+# V8.0 终极修复：移除分页加载，只渲染尾部 60 条消息，彻底解决 removeChild DOM 崩溃
+MAX_RENDER_MSGS = 60
+render_msgs = st.session_state.messages[-MAX_RENDER_MSGS:]
  
 for m in render_msgs:
     with st.chat_message(m.get("role", "user")):
@@ -774,12 +765,10 @@ if not st.session_state.generating and st.session_state.messages:
         if st.button("➕ 新建会话", use_container_width=True):
             old_sid = st.session_state.session_id
             if old_sid and st.session_state.messages:
-                # P2 修复：异步执行后加载，防止阻塞 UI
                 _backup_executor.submit(trigger_backup_and_restore, old_sid)
             st.session_state.session_id = str(uuid.uuid4())
             st.session_state.messages = []
             st.session_state.history_loaded = False
-            st.session_state.render_offset = 0
             st.session_state.generating = False
             st.session_state.stop = False
             st.rerun()
