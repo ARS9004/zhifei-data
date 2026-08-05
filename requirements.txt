@@ -11,3 +11,4 @@ pymysql>=1.1.0
 oss2
 aliyun-python-sdk-core
 aliyun-python-sdk-sts
+starlette<1.0.0
