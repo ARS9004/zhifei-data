@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
  
 """
-智飞投研 · 云端轻量版 v8.0 正式版（2026-08-05）
+智飞投研 · 云端轻量版 v8.0 终极版（2026-08-05）
 - [P0] call_bailian 删除重复拉取历史，新增 _clean_for_api 严格格式校验
 - [P0] sync_to_oss 修复 Normal 文件追加崩溃，先删除再重建
 - [P0] read_oss_tail 修复首尾截断，逐行容错解析
@@ -14,6 +14,7 @@
 - [P2] SQLite 降级读取增加逐行 JSON 容错
 - [P2] RDS 连接增加 try-finally 防泄漏
 - [P2] trigger_backup_and_restore 改为异步执行，防止阻塞 UI
+- [终极修复] 稳定 UI 组件树，彻底解决 removeChild DOM 崩溃白屏问题
 """
  
 import os
@@ -21,6 +22,7 @@ import re
 import json
 import time
 import uuid
+import atexit
 import logging
 import sqlite3
 import threading
@@ -674,7 +676,7 @@ def init_session_on_startup():
         st.session_state.history_loaded = True
  
  
-# ================= UI =================
+# ================= UI (终极稳定版) =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("📱 智飞投研")
  
@@ -689,15 +691,17 @@ if "stop" not in st.session_state:
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
  
-# V8.0 终极修复：移除分页加载，只渲染尾部 60 条消息，彻底解决 removeChild DOM 崩溃
-MAX_RENDER_MSGS = 60
-render_msgs = st.session_state.messages[-MAX_RENDER_MSGS:]
+# 稳定的容器：只渲染尾部 60 条消息
+chat_container = st.container()
+with chat_container:
+    MAX_RENDER_MSGS = 60
+    render_msgs = st.session_state.messages[-MAX_RENDER_MSGS:] if st.session_state.messages else []
+    
+    for m in render_msgs:
+        with st.chat_message(m.get("role", "user")):
+            st.markdown(str(m.get("content") or ""))
  
-for m in render_msgs:
-    with st.chat_message(m.get("role", "user")):
-        st.markdown(str(m.get("content") or ""))
- 
-user_input = st.chat_input("输入消息...")
+user_input = st.chat_input("输入消息...", disabled=st.session_state.generating)
  
 if user_input and not st.session_state.generating:
     st.session_state.stop = False
@@ -752,39 +756,34 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
     st.session_state.generating = False
     st.rerun()
  
-if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] != "user":
-    with st.chat_message("assistant"):
-        st.markdown("⏳ 生成中...")
-    if st.button("⏹ 暂停", use_container_width=True):
-        st.session_state.stop = True
+# 底部控制栏：永远稳定渲染，只通过 disabled 控制状态，绝不改变 DOM 结构
+st.divider()
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("➕ 新建会话", use_container_width=True, disabled=st.session_state.generating):
+        old_sid = st.session_state.session_id
+        if old_sid and st.session_state.messages:
+            _backup_executor.submit(trigger_backup_and_restore, old_sid)
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.session_state.history_loaded = False
+        st.session_state.generating = False
+        st.session_state.stop = False
         st.rerun()
- 
-if not st.session_state.generating and st.session_state.messages:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("➕ 新建会话", use_container_width=True):
-            old_sid = st.session_state.session_id
-            if old_sid and st.session_state.messages:
-                _backup_executor.submit(trigger_backup_and_restore, old_sid)
-            st.session_state.session_id = str(uuid.uuid4())
-            st.session_state.messages = []
-            st.session_state.history_loaded = False
-            st.session_state.generating = False
+with col2:
+    if st.button("🔄 重新生成", use_container_width=True, disabled=not st.session_state.generating):
+        if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+            st.session_state.messages.pop()
+            st.session_state.generating = True
             st.session_state.stop = False
             st.rerun()
-    with col2:
-        if st.button("🔄 重新生成", use_container_width=True):
-            if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
-                st.session_state.messages.pop()
-                st.session_state.generating = True
-                st.session_state.stop = False
-                st.rerun()
-    with col3:
-        if st.button("📤 导出TXT", use_container_width=True):
-            txt = export_txt(st.session_state.messages)
-            download_key = f"dl_{datetime.now(BEIJING_TZ).strftime('%Y%m%d%H%M%S')}"
-            st.download_button(
-                "📥 下载", txt,
-                f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt",
-                "text/plain", key=download_key
-            )
+with col3:
+    # 直接渲染下载按钮，避免动态出现组件导致 DOM 突变
+    st.download_button(
+        label="📤 导出TXT",
+        data=export_txt(st.session_state.messages),
+        file_name=f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt",
+        mime="text/plain",
+        use_container_width=True,
+        key="export_txt_btn"
+    )
