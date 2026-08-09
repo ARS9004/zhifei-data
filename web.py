@@ -298,43 +298,44 @@ def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
         lines = read_oss_full()
         if not lines:
             return []
- 
+
     valid_lines = _filter_and_dedup(lines, session_id)
-    
+
     if not valid_lines:
         full_lines = read_oss_full()
         if full_lines:
             valid_lines = _filter_and_dedup(full_lines, session_id)
- 
+
     if not valid_lines:
         return []
- 
+
     sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
     recent = sorted_lines[:limit]
- 
+
     result = []
-for item in reversed(recent):
-    msgs_data = item.get("messages", {})
-    if isinstance(msgs_data, str):
-        try:
-            msgs_data = json.loads(msgs_data)
-        except Exception:
-            msgs_data = {}
-    
-    # 兼容两种格式：{"messages": [...]} 或直接是 [...]
-    if isinstance(msgs_data, dict) and "messages" in msgs_data:
-        msg_list = msgs_data["messages"]
-    elif isinstance(msgs_data, list):
-        msg_list = msgs_data
-    else:
-        msg_list = []
-    
-    for msg in msg_list:
-        if isinstance(msg, dict):
-            result.append({
-                "role": msg.get("role"),
-                "content": msg.get("content")
-            })
+    for item in reversed(recent):
+        msgs_data = item.get("messages", {})
+        if isinstance(msgs_data, str):
+            try:
+                msgs_data = json.loads(msgs_data)
+            except Exception:
+                msgs_data = {}
+
+        # 兼容两种格式：{"messages": [...]} 或直接是 [...]
+        if isinstance(msgs_data, dict) and "messages" in msgs_data:
+            msg_list = msgs_data["messages"]
+        elif isinstance(msgs_data, list):
+            msg_list = msgs_data
+        else:
+            msg_list = []
+
+        for msg in msg_list:
+            if isinstance(msg, dict):
+                result.append({
+                    "role": msg.get("role"),
+                    "content": msg.get("content")
+                })
+
     return result
  
  
