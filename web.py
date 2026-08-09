@@ -313,14 +313,24 @@ def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
     recent = sorted_lines[:limit]
  
     result = []
-    for item in reversed(recent):
-        msgs_data = item.get("messages", {})
-        if isinstance(msgs_data, str):
-            try:
-                msgs_data = json.loads(msgs_data)
-            except Exception:
-                msgs_data = {}
-        for msg in msgs_data.get("messages", []):
+for item in reversed(recent):
+    msgs_data = item.get("messages", {})
+    if isinstance(msgs_data, str):
+        try:
+            msgs_data = json.loads(msgs_data)
+        except Exception:
+            msgs_data = {}
+    
+    # 兼容两种格式：{"messages": [...]} 或直接是 [...]
+    if isinstance(msgs_data, dict) and "messages" in msgs_data:
+        msg_list = msgs_data["messages"]
+    elif isinstance(msgs_data, list):
+        msg_list = msgs_data
+    else:
+        msg_list = []
+    
+    for msg in msg_list:
+        if isinstance(msg, dict):
             result.append({
                 "role": msg.get("role"),
                 "content": msg.get("content")
@@ -742,23 +752,24 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
     try:
         with st.spinner("💭 思考中..."):
             reply = call_bailian_with_token_check(ctx)
- 
+
         assistant_msg = {
             "role": "assistant",
             "content": reply,
             "timestamp": datetime.now(BEIJING_TZ).isoformat()
         }
         st.session_state.messages.append(assistant_msg)
- 
-        messages_dict = {"messages": [user_msg, assistant_msg]}
+
+        messages_list = [user_msg, assistant_msg]
+        messages_dict = {"messages": messages_list}
         save_to_sqlite(session_id, round_num, messages_dict, user_msg["timestamp"])
         sync_to_oss([{
             "session_id": session_id,
             "round_num": round_num,
-            "messages": messages_dict,
+            "messages": messages_list,
             "ts": user_msg["timestamp"]
         }])
- 
+
     except Exception as e:
         st.error(f"❌ 错误: {e}")
         st.session_state.messages.append({
