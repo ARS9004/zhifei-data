@@ -567,23 +567,39 @@ def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
- 
+
     sys_parts = [f"你是智飞投研助手。当前时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M')}"]
     summary = get_cumulative_summary_from_oss()
     if summary:
         sys_parts.append(f"\n【历史对话摘要】\n{summary}")
     
     full_msgs = [{"role": "system", "content": "\n".join(sys_parts)}]
- 
+
     cleaned = _clean_for_api(messages)
     if not cleaned:
         raise RuntimeError("上下文中没有有效的用户消息")
     full_msgs.extend(cleaned)
- 
+
+    # ====== 改这里 ======
+    ASSISTANT_ID = "45db2f797bfd49229f757b04ed13ac92"          # 直接写死，或者从环境变量读取
+    # ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+    # ===================
+
     retries, delay = 3, 2
     for attempt in range(retries):
         try:
-            resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
+            # 原来的调用：
+            # resp = dashscope.Generation.call(model=MODEL_NAME, messages=full_msgs, result_format="message", stream=False)
+            
+            # 改为调用智能体：
+            resp = dashscope.Assistant.call(
+                model=ASSISTANT_ID,
+                messages=full_msgs,
+                result_format="message",
+                stream=False,
+                # 可选：传递 session_id 让百炼维持上下文（如果不传，百炼会自动生成）
+                # session_id=st.session_state.get("session_id", str(uuid.uuid4()))
+            )
             if resp.status_code == HTTPStatus.OK and resp.output.choices:
                 reset_health_status()
                 return resp.output.choices[0].message.content
