@@ -220,7 +220,7 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
 def read_oss_tail(size=40960):
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_FILENAME
+        remote = OSS_PREFIX +  "chat_memory.jsonl"
         meta = oss_head_with_retry(bucket, remote, max_retry=2)
         length = meta.content_length
         read_size = min(length, size)
