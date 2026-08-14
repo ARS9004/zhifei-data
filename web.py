@@ -158,6 +158,9 @@ def get_rds_connection():
 def get_or_create_session() -> str:
     if "session_id" not in st.session_state or not st.session_state.session_id:
         st.session_state.session_id = str(uuid.uuid4())
+        print(f"🔍 get_or_create_session: 新生成 session_id = {st.session_state.session_id}")
+    else:
+        print(f"🔍 get_or_create_session: 使用已有 session_id = {st.session_state.session_id}")
     return st.session_state.session_id
  
  
@@ -283,10 +286,12 @@ def _filter_and_dedup(lines: List[Dict], session_id: str = None) -> List[Dict]:
  
  
 def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
+    print("🔍 get_recent_messages 被调用")
     lines = read_oss_tail()
     if not lines:
         lines = read_oss_full()
         if not lines:
+            print("🔍 get_recent_messages: OSS 无数据")
             return []
  
     valid_lines = _filter_and_dedup(lines, session_id)
@@ -297,10 +302,12 @@ def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
             valid_lines = _filter_and_dedup(full_lines, session_id)
  
     if not valid_lines:
+        print("🔍 get_recent_messages: 过滤后无有效数据")
         return []
  
     sorted_lines = sorted(valid_lines, key=lambda x: x.get("ts", ""), reverse=True)
     recent = sorted_lines[:limit]
+    print(f"🔍 get_recent_messages: 取到 {len(recent)} 条消息")
  
     result = []
     for item in reversed(recent):
@@ -538,7 +545,7 @@ def save_to_sqlite(session_id: str, round_num: int, messages: dict, ts: str):
         logger.warning(f"SQLite 写入失败: {e}")
  
  
-# ================= V8.0 正式版：sync_to_oss =================
+# ================= V8.0 正式版：sync_to_oss（改动二：删掉 remote_path 参数） =================
 def sync_to_oss(lines):
     try:
         bucket = get_oss_client()
@@ -565,6 +572,7 @@ def sync_to_oss(lines):
             bucket.append_object(remote, 0, content_bytes)
             
         logger.info(f"✅ OSS 追加写入成功: {len(lines)} 行")
+        print(f"🔍 sync_to_oss: 写入 {len(lines)} 行到 {remote}")
         return len(lines)
     except Exception as e:
         logger.error(f"❌ OSS 追加写入失败: {e}")
@@ -684,6 +692,7 @@ def call_bailian(messages: List[Dict]) -> str:
         cleaned[0] = {"role": "user", "content": first_user_content}
         
     full_msgs = cleaned
+    print(f"🔍 call_bailian: 发送 {len(full_msgs)} 条消息给模型")
  
     BAILIAN_APP_ID = "45db2f797bfd49229f757b04ed13ac92"
  
@@ -756,12 +765,15 @@ def init_session_on_startup():
         st.session_state.session_id = ""
         st.session_state.cached_summary = ""
         st.session_state.render_offset = 0
+        print("🔍 init_session_on_startup: 初始化 messages 为空列表")
  
     if not st.session_state.messages and not st.session_state.history_loaded:
         session_id = get_or_create_session()
         st.session_state.session_id = session_id
+        print(f"🔍 init_session_on_startup: 当前 session_id = {session_id}")
  
         msgs = get_recent_messages(session_id=session_id, limit=5)
+        print(f"🔍 init_session_on_startup: get_recent_messages 返回 {len(msgs)} 条消息")
         
         if not msgs:
             try:
@@ -779,6 +791,7 @@ def init_session_on_startup():
                         continue
                 if msgs:
                     logger.info(f"✅ OSS 失败，从 SQLite 兜底恢复 {len(msgs)} 条消息")
+                    print(f"🔍 init_session_on_startup: SQLite 兜底恢复 {len(msgs)} 条")
             except Exception as e:
                 logger.warning(f"SQLite 兜底读取失败: {e}")
  
@@ -788,6 +801,7 @@ def init_session_on_startup():
                 m["session_id"] = session_id
             st.session_state.messages = msgs
             logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {session_id}）")
+            print(f"🔍 init_session_on_startup: 最终恢复 {len(msgs)} 条消息")
             
         st.session_state.history_loaded = True
  
@@ -803,6 +817,8 @@ if "generating" not in st.session_state:
     st.session_state.generating = False
 if "stop" not in st.session_state:
     st.session_state.stop = False
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # 兜底保护
  
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
