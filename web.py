@@ -154,11 +154,6 @@ def get_rds_connection():
     )
  
  
-def get_or_create_session() -> str:
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
-    return st.session_state.session_id
- 
  
 # ================= OSS 客户端 =================
 def get_oss_client():
@@ -749,24 +744,27 @@ def export_txt(messages):
  
 # ================= 启动初始化 =================
 def init_session_on_startup():
+    # 强制初始化 session_id，绝不依赖外部存储
+    if "session_id" not in st.session_state or not st.session_state.session_id:
+        st.session_state.session_id = str(uuid.uuid4())
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.history_loaded = False
-        st.session_state.session_id = ""
         st.session_state.cached_summary = ""
         st.session_state.render_offset = 0
- 
+
     if not st.session_state.messages and not st.session_state.history_loaded:
-        session_id = get_or_create_session()
-        st.session_state.session_id = session_id
- 
-        msgs = get_recent_messages(session_id=session_id, limit=5)
-        
+        msgs = get_recent_messages(session_id=st.session_state.session_id, limit=5)
+
         if not msgs:
             try:
                 conn = sqlite3.connect(MEMORY_DB_PATH)
                 cursor = conn.cursor()
-                cursor.execute("SELECT messages FROM chat_memory_new WHERE session_id = ? ORDER BY ts DESC LIMIT 5", (session_id,))
+                cursor.execute(
+                    "SELECT messages FROM chat_memory_new WHERE session_id = ? ORDER BY ts DESC LIMIT 5",
+                    (st.session_state.session_id,)
+                )
                 rows = cursor.fetchall()
                 conn.close()
                 for row in reversed(rows):
@@ -780,14 +778,14 @@ def init_session_on_startup():
                     logger.info(f"✅ OSS 失败，从 SQLite 兜底恢复 {len(msgs)} 条消息")
             except Exception as e:
                 logger.warning(f"SQLite 兜底读取失败: {e}")
- 
+
         if msgs:
             for m in msgs:
                 m["timestamp"] = datetime.now(BEIJING_TZ).isoformat()
-                m["session_id"] = session_id
+                m["session_id"] = st.session_state.session_id
             st.session_state.messages = msgs
-            logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {session_id}）")
-            
+            logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {st.session_state.session_id}）")
+
         st.session_state.history_loaded = True
  
  
@@ -796,7 +794,17 @@ st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("📱 智飞投研")
  
 init_memory_db()
-init_session_on_startup()
+def init_session_on_startup():
+    # 强制初始化 session_id，绝不依赖外部存储
+    if "session_id" not in st.session_state or not st.session_state.session_id:
+        st.session_state.session_id = str(uuid.uuid4())
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        st.session_state.history_loaded = False
+        st.session_state.cached_summary = ""
+        st.session_state.render_offset = 0
+    # ... 后面代码不变
  
 if "generating" not in st.session_state:
     st.session_state.generating = False
