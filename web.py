@@ -887,7 +887,7 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "session_id": st.session_state.session_id,
             "round_num": round_num,
             "messages": messages_dict,
-            "ts": user_msg["timestamp"]
+            "ts": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
         }])
  
     except Exception as e:
