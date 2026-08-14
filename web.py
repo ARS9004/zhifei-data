@@ -156,24 +156,7 @@ def get_rds_connection():
  
 def get_or_create_session() -> str:
     if "session_id" not in st.session_state:
-        conn = None
-        try:
-            conn = get_rds_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT session_id FROM chat_memory WHERE is_deleted = 0 ORDER BY ts DESC LIMIT 1")
-            row = cursor.fetchone()
-            if row:
-                st.session_state.session_id = row[0]
-                logger.info(f"✅ 从 RDS 恢复 session_id: {st.session_state.session_id}")
-            else:
-                st.session_state.session_id = str(uuid.uuid4())
-                logger.info(f"🆕 RDS 无历史数据，新建 session_id: {st.session_state.session_id}")
-        except Exception as e:
-            logger.warning(f"RDS 读取失败，新建 session_id: {e}")
-            st.session_state.session_id = str(uuid.uuid4())
-        finally:
-            if conn:
-                conn.close()
+        st.session_state.session_id = str(uuid.uuid4())
     return st.session_state.session_id
  
  
@@ -220,7 +203,7 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
 def read_oss_tail(size=40960):
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX +  "chat_memory.jsonl"
+        remote = OSS_PREFIX + OSS_FILENAME
         meta = oss_head_with_retry(bucket, remote, max_retry=2)
         length = meta.content_length
         read_size = min(length, size)
@@ -887,7 +870,7 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "round_num": round_num,
             "messages": messages_dict,
             "ts": user_msg["timestamp"]
-        }])
+        }], remote_path="chat_history/chat_history.jsonl")
  
     except Exception as e:
         st.error(f"❌ 错误: {e}")
