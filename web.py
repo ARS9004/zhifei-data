@@ -870,7 +870,7 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "round_num": round_num,
             "messages": messages_dict,
             "ts": user_msg["timestamp"]
-        }]
+        }])
  
     except Exception as e:
         st.error(f"❌ 错误: {e}")
