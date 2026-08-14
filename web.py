@@ -1,4 +1,4 @@
-	#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
  
 """
@@ -153,6 +153,12 @@ def get_rds_connection():
         write_timeout=30
     )
  
+ 
+# ================= 改动一：get_or_create_session（删掉 RDS 查表逻辑） =================
+def get_or_create_session() -> str:
+    if "session_id" not in st.session_state or not st.session_state.session_id:
+        st.session_state.session_id = str(uuid.uuid4())
+    return st.session_state.session_id
  
  
 # ================= OSS 客户端 =================
@@ -744,35 +750,24 @@ def export_txt(messages):
  
 # ================= 启动初始化 =================
 def init_session_on_startup():
-    # 强制初始化 session_id
-    if "session_id" not in st.session_state or not st.session_state.session_id:
-        st.session_state.session_id = str(uuid.uuid4())
-
-    # 强制初始化 messages（确保 key 一定存在）
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.history_loaded = False
+        st.session_state.session_id = ""
         st.session_state.cached_summary = ""
         st.session_state.render_offset = 0
-    else:
-        # 如果已存在，确保相关 key 也都存在
-        st.session_state.setdefault("history_loaded", False)
-        st.session_state.setdefault("cached_summary", "")
-        st.session_state.setdefault("render_offset", 0)
-
-    # 如果还没有加载历史消息，尝试恢复
-    if not st.session_state.history_loaded:
-        msgs = get_recent_messages(session_id=st.session_state.session_id, limit=5)
-
+ 
+    if not st.session_state.messages and not st.session_state.history_loaded:
+        session_id = get_or_create_session()
+        st.session_state.session_id = session_id
+ 
+        msgs = get_recent_messages(session_id=session_id, limit=5)
+        
         if not msgs:
-            # 兜底：从 SQLite 读
             try:
                 conn = sqlite3.connect(MEMORY_DB_PATH)
                 cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT messages FROM chat_memory_new WHERE session_id = ? ORDER BY ts DESC LIMIT 5",
-                    (st.session_state.session_id,)
-                )
+                cursor.execute("SELECT messages FROM chat_memory_new WHERE session_id = ? ORDER BY ts DESC LIMIT 5", (session_id,))
                 rows = cursor.fetchall()
                 conn.close()
                 for row in reversed(rows):
@@ -786,14 +781,14 @@ def init_session_on_startup():
                     logger.info(f"✅ OSS 失败，从 SQLite 兜底恢复 {len(msgs)} 条消息")
             except Exception as e:
                 logger.warning(f"SQLite 兜底读取失败: {e}")
-
+ 
         if msgs:
             for m in msgs:
                 m["timestamp"] = datetime.now(BEIJING_TZ).isoformat()
-                m["session_id"] = st.session_state.session_id
+                m["session_id"] = session_id
             st.session_state.messages = msgs
-            logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {st.session_state.session_id}）")
-
+            logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {session_id}）")
+            
         st.session_state.history_loaded = True
  
  
@@ -802,17 +797,7 @@ st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("📱 智飞投研")
  
 init_memory_db()
-def init_session_on_startup():
-    # 强制初始化 session_id，绝不依赖外部存储
-    if "session_id" not in st.session_state or not st.session_state.session_id:
-        st.session_state.session_id = str(uuid.uuid4())
-    
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.history_loaded = False
-        st.session_state.cached_summary = ""
-        st.session_state.render_offset = 0
-    # ... 后面代码不变
+init_session_on_startup()
  
 if "generating" not in st.session_state:
     st.session_state.generating = False
@@ -881,8 +866,9 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
         messages_list = [user_msg, assistant_msg]
         messages_dict = {"messages": messages_list}
         save_to_sqlite(session_id, round_num, messages_dict, user_msg["timestamp"])
+        # ================= 改动二和三：删 remote_path，session_id 强制取 st.session_state.session_id =================
         sync_to_oss([{
-            "session_id": session_id,
+            "session_id": st.session_state.session_id,
             "round_num": round_num,
             "messages": messages_dict,
             "ts": user_msg["timestamp"]
