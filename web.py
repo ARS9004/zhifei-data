@@ -203,7 +203,7 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
 def read_oss_tail(size=40960):
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_FILENAME
+        remote = OSS_PREFIX +  "chat_memory.jsonl"
         meta = oss_head_with_retry(bucket, remote, max_retry=2)
         length = meta.content_length
         read_size = min(length, size)
@@ -870,7 +870,7 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             "round_num": round_num,
             "messages": messages_dict,
             "ts": user_msg["timestamp"]
-        }], remote_path="chat_history/chat_history.jsonl")
+        }])
  
     except Exception as e:
         st.error(f"❌ 错误: {e}")
