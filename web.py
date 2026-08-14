@@ -744,20 +744,28 @@ def export_txt(messages):
  
 # ================= 启动初始化 =================
 def init_session_on_startup():
-    # 强制初始化 session_id，绝不依赖外部存储
+    # 强制初始化 session_id
     if "session_id" not in st.session_state or not st.session_state.session_id:
         st.session_state.session_id = str(uuid.uuid4())
 
+    # 强制初始化 messages（确保 key 一定存在）
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.history_loaded = False
         st.session_state.cached_summary = ""
         st.session_state.render_offset = 0
+    else:
+        # 如果已存在，确保相关 key 也都存在
+        st.session_state.setdefault("history_loaded", False)
+        st.session_state.setdefault("cached_summary", "")
+        st.session_state.setdefault("render_offset", 0)
 
-    if not st.session_state.messages and not st.session_state.history_loaded:
+    # 如果还没有加载历史消息，尝试恢复
+    if not st.session_state.history_loaded:
         msgs = get_recent_messages(session_id=st.session_state.session_id, limit=5)
 
         if not msgs:
+            # 兜底：从 SQLite 读
             try:
                 conn = sqlite3.connect(MEMORY_DB_PATH)
                 cursor = conn.cursor()
