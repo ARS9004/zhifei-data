@@ -833,6 +833,14 @@ def init_session_on_startup():
             print(f"🔍 init_session_on_startup: RDS 恢复失败: {e}")
 
         if msgs:
+            rounds_count = len([m for m in msgs if m.get("role") == "user"])
+            st.session_state.rds_restore_status = {
+                "running": False,
+                "success": True,
+                "rounds": rounds_count,
+                "source": "RDS chat_memory (启动恢复)",
+                "error": None
+           }
             st.session_state.restore_status = {
                 "running": False,
                 "summary_restored": False,
@@ -1001,6 +1009,20 @@ with st.sidebar:
         else:
             st.caption("⏳ 尚未恢复上文")
 
+# ===== RDS 恢复状态 =====
+    rds_status = st.session_state.get("rds_restore_status", {})
+    if rds_status.get("running"):
+        st.info("⏳ 正在恢复上文...")
+    elif rds_status.get("success"):
+        st.success(f"✅ 上文恢复成功")
+    if rds_status.get("rounds", 0) > 0:
+        st.caption(f"💬 最近 {rds_status['rounds']} 轮对话已恢复")
+    if rds_status.get("source"):
+        st.caption(f"📦 来源: {rds_status['source']}")
+    elif rds_status.get("error"):
+        st.error(f"❌ 恢复失败: {rds_status['error']}")
+    else:
+        st.caption("⏳ 尚未恢复上文")
     # ===== OSS 写入状态 =====
     oss_status = st.session_state.get("oss_write_status", {})
     if oss_status.get("running"):
