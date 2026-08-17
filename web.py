@@ -776,6 +776,7 @@ def init_session_on_startup():
     云端启动初始化，从 OSS chat_history.jsonl 恢复历史对话
     返回恢复结果字典，供侧边栏显示
     """
+def init_session_on_startup():
     result = {"success": False, "rounds": 0, "error": None, "source": None}
 
     if "messages" not in st.session_state:
@@ -791,10 +792,46 @@ def init_session_on_startup():
 
         msgs = []
         try:
-            # 从 OSS 读取最近 5 轮对话
-            msgs = get_recent_messages_from_oss(session_id=session_id, limit=5)
-            if msgs:
-                logger.info(f"✅ 从 OSS chat_history 恢复 {len(msgs)} 条消息")
+            # 不按 session_id 过滤，取最近 5 轮对话
+            lines = read_oss_tail()
+            if not lines:
+                lines = read_oss_full()
+            
+            if lines:
+                # 去重，按 ts 排序取最近 5 轮
+                seen = set()
+                deduped = []
+                for item in lines:
+                    if not isinstance(item, dict):
+                        continue
+                    key = (item.get("session_id"), item.get("round_num"))
+                    if key in seen or key[0] is None or key[1] is None:
+                        continue
+                    seen.add(key)
+                    deduped.append(item)
+                
+                deduped.sort(key=lambda x: x.get("ts", ""), reverse=True)
+                recent = deduped[:5]
+                
+                for item in reversed(recent):
+                    msgs_data = item.get("messages", {})
+                    if isinstance(msgs_data, str):
+                        try:
+                            msgs_data = json.loads(msgs_data)
+                        except Exception:
+                            continue
+                    if isinstance(msgs_data, dict) and "messages" in msgs_data:
+                        msg_list = msgs_data["messages"]
+                    elif isinstance(msgs_data, list):
+                        msg_list = msgs_data
+                    else:
+                        msg_list = []
+                    for msg in msg_list:
+                        if isinstance(msg, dict):
+                            msgs.append(msg)
+                
+                if msgs:
+                    logger.info(f"✅ 从 OSS 恢复 {len(msgs)} 条消息")
         except Exception as e:
             result["error"] = str(e)
             logger.warning(f"OSS 恢复失败: {e}")
@@ -810,13 +847,11 @@ def init_session_on_startup():
                     m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
                 m["session_id"] = session_id
             st.session_state.messages = msgs
-            logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {session_id}）")
         else:
             result["success"] = True
             result["rounds"] = 0
             result["source"] = "无历史数据"
 
-        # 同时加载累积摘要
         try:
             cumulative = get_cumulative_summary_from_oss()
             if cumulative:
@@ -832,6 +867,7 @@ def init_session_on_startup():
         result["source"] = "已缓存"
 
     return result
+
 
 
 # ================= UI =================
