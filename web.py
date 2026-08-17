@@ -70,8 +70,8 @@ BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
-OSS_FILENAME = "chat_history.jsonl"
-OSS_SUMMARY_WINDOW_FILE = "chat_summary_window.json"
+OSS_FILENAME = "chat_memory.jsonl"
+OSS_SUMMARY_WINDOW_FILE = "chat_summary.json"
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 
