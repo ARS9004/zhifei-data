@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v2.0 正式版 (2026-08-17)
+智飞投研 · 云端轻量版 v1.5 正式版 (2026-08-10)
 - [v1.5] 修复 _classify_error：空字符串异常归类为 network，防止误触发模型熔断。
 - [v1.5] 优化熔断阈值：model 连续失败阈值从 2 提升至 3，容忍百炼短暂抖动。
 - [v1.5] 优化 _extract_text_from_response：方式 4 显式判断 text 和 content，提升可读性与健壮性。
@@ -18,6 +18,7 @@ import atexit
 import logging
 import sqlite3
 import threading
+import io
 import concurrent.futures
 from datetime import datetime
 from typing import List, Dict
@@ -32,6 +33,10 @@ from http import HTTPStatus
 from dotenv import load_dotenv
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
+
+from docx import Document
+from docx.shared import Pt
+from docx.oxml.ns import qn
 
 load_dotenv()
 
@@ -66,7 +71,6 @@ if not DASHSCOPE_API_KEY:
 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
-MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./chat_memory.db")
 
 # ================= RDS 配置 =================
 RDS_HOST = get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com")
@@ -203,7 +207,7 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
             time.sleep(delay * (attempt + 1))
 
 
-# ================= V2.0 核心：尾部读取 =================
+# ================= V8.0 核心：尾部读取 =================
 def read_oss_tail(size=40960):
     try:
         bucket = get_oss_client()
@@ -542,7 +546,7 @@ def trigger_backup_and_restore(old_session_id: str):
             conn.close()
 
 
-# ================= V2.0 正式版：sync_to_oss（改动二：删掉 remote_path 参数） =================
+# ================= V8.0 正式版：sync_to_oss（改动二：删掉 remote_path 参数） =================
 def sync_to_oss(lines):
     # ================= 初始化 OSS 写入状态 =================
     st.session_state.oss_write_status = {"running": True, "success": False, "lines": 0, "error": None}
@@ -584,7 +588,7 @@ def sync_to_oss(lines):
         raise
 
 
-# ================= V2.0 正式版：模型调用 =================
+# ================= V8.0 正式版：模型调用 =================
 def _clean_for_api(raw_msgs: List[Dict]) -> List[Dict]:
     valid = []
     for m in raw_msgs:
@@ -664,7 +668,7 @@ def call_bailian(messages: List[Dict]) -> str:
         raise RuntimeError("服务暂时不可用")
     dashscope.api_key = DASHSCOPE_API_KEY
 
-    # ================= 上文恢复等待/消费逻辑 =================
+    # ================= 上文恢复等待/消费逻辑（零改动） =================
     if st.session_state.get("is_restoring"):
         for _ in range(20):
             with _recovery_lock:
@@ -751,15 +755,35 @@ def call_bailian_with_token_check(messages: List[Dict]) -> str:
     return call_bailian(messages)
 
 
-def export_txt(messages):
-    lines = []
+def export_docx(messages):
+    """导出对话为 DOCX 格式"""
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = '仿宋'
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+
+    title = doc.add_heading('', level=1)
+    title_run = title.add_run("智飞投研对话记录")
+    title_run.font.name = '仿宋'
+    title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+    title_run.font.size = Pt(16)
+    title_run.font.bold = True
+
     for m in messages:
         role = "用户" if m.get("role") == "user" else "助手"
         content = m.get("content") or ""
         ts = m.get("timestamp", "")[:16]
         prefix = f"[{ts}] " if ts else ""
-        lines.append(f"{prefix}{role}：{content}")
-    return "\n\n".join(lines)
+        para = doc.add_paragraph()
+        run = para.add_run(f"{prefix}{role}：{content}")
+        run.font.name = '仿宋'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+        run.font.size = Pt(14)
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 
 # ================= 启动初始化 =================
@@ -809,6 +833,13 @@ def init_session_on_startup():
             print(f"🔍 init_session_on_startup: RDS 恢复失败: {e}")
 
         if msgs:
+            st.session_state.restore_status = {
+                "running": False,
+                "summary_restored": False,
+                "rounds_restored": len([m for m in msgs if m.get("role") == "user"]),
+                "error": None,
+                "source": "RDS chat_memory (启动恢复)"
+            }
             for m in msgs:
                 if "timestamp" not in m:
                     m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -820,7 +851,7 @@ def init_session_on_startup():
         st.session_state.history_loaded = True
 
 
-# ================= UI (稳定版) =================
+# ================= UI (终极稳定版) =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("📱 智飞投研")
 
@@ -936,12 +967,12 @@ with col2:
             st.rerun()
 with col3:
     st.download_button(
-        label="📤 导出TXT",
-        data=export_txt(st.session_state.messages),
-        file_name=f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.txt",
-        mime="text/plain",
+        label="📤 导出DOCX",
+        data=export_docx(st.session_state.messages),
+        file_name=f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         use_container_width=True,
-        key="export_txt_btn"
+        key="export_docx_btn"
     )
 
 # ================= 侧边栏：系统状态显示 =================
