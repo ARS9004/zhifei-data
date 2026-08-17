@@ -979,24 +979,29 @@ with col3:
 with st.sidebar:
     st.subheader("📋 系统状态")
 
-    # 恢复状态
-    restore_status = st.session_state.get("restore_status", {})
-    if restore_status.get("running"):
-        st.info("⏳ 正在恢复上文...")
-    elif restore_status.get("error"):
-        st.error(f"❌ 恢复失败: {restore_status['error']}")
-    elif restore_status.get("summary_restored") or restore_status.get("rounds_restored", 0) > 0:
-        st.success("✅ 上文恢复成功")
-        if restore_status.get("summary_restored"):
-            st.caption("📄 摘要已恢复")
-        if restore_status.get("rounds_restored", 0) > 0:
-            st.caption(f"💬 最近 {restore_status['rounds_restored']} 轮对话已恢复")
-        if restore_status.get("source"):
-            st.caption(f"📦 来源: {restore_status['source']}")
-    else:
-        st.caption("⏳ 尚未恢复上文")
+    # ===== 恢复状态：直接从 messages 计算 =====
+    msgs = st.session_state.get("messages", [])
+    user_msgs = [m for m in msgs if m.get("role") == "user"]
+    rounds_restored = len(user_msgs)
+    has_summary = bool(st.session_state.get("cached_summary") or st.session_state.get("restore_status", {}).get("summary_restored"))
 
-    # OSS 写入状态
+    if rounds_restored > 0:
+        st.success("✅ 上文恢复成功")
+        st.caption(f"💬 最近 {rounds_restored} 轮对话已恢复")
+        if has_summary:
+            st.caption("📄 摘要已恢复")
+        st.caption("📦 来源: RDS chat_memory")
+    else:
+        # 检查是否正在恢复
+        restore_status = st.session_state.get("restore_status", {})
+        if restore_status.get("running"):
+            st.info("⏳ 正在恢复上文...")
+        elif restore_status.get("error"):
+            st.error(f"❌ 恢复失败: {restore_status['error']}")
+        else:
+            st.caption("⏳ 尚未恢复上文")
+
+    # ===== OSS 写入状态 =====
     oss_status = st.session_state.get("oss_write_status", {})
     if oss_status.get("running"):
         st.info("⏳ 正在写入 OSS...")
