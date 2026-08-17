@@ -751,12 +751,15 @@ def export_docx(messages):
 # ================= 启动初始化 =================
 def init_session_on_startup():
     """
-    启动初始化：不碰 messages，只确保 session_id 存在
-    聊天框渲染的数据由 st.session_state.messages 自己保留
+    - 聊天框：messages 为空时从 OSS 加载一次，之后永远不清空
+    - 模型上文：从 OSS 读取累积摘要 + 当前 session 最近5轮对话
+    - 返回 restore_result 反映模型上文恢复状态
     """
-    result = {"success": False, "rounds": 0, "error": None, "source": None}
+    result = {
+        "success": False, "rounds": 0, "error": None,
+        "source": None, "summary_restored": False
+    }
 
-    # 只初始化不存在的 key，不覆盖已有的 messages
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "history_loaded" not in st.session_state:
@@ -768,86 +771,83 @@ def init_session_on_startup():
     if "render_offset" not in st.session_state:
         st.session_state.render_offset = 0
 
-    # 确保 session_id 存在
     if not st.session_state.session_id:
         st.session_state.session_id = str(uuid.uuid4())
 
-    # 如果 messages 已有数据（上次渲染保留的），直接返回
-    if st.session_state.messages:
-        result["success"] = True
-        result["rounds"] = len([m for m in st.session_state.messages if m.get("role") == "user"])
-        result["source"] = "已缓存"
-        return result
+    if not st.session_state.history_loaded:
+        # 聊天框：只在 messages 为空时从 OSS 加载一次
+        if not st.session_state.messages:
+            try:
+                lines = read_oss_full()
+                if not lines:
+                    lines = read_oss_tail()
+                if lines:
+                    seen = set()
+                    deduped = []
+                    for item in lines:
+                        if not isinstance(item, dict):
+                            continue
+                        key = (item.get("session_id"), item.get("round_num"))
+                        if key in seen or key[0] is None or key[1] is None:
+                            continue
+                        seen.add(key)
+                        deduped.append(item)
+                    deduped.sort(key=lambda x: x.get("ts", ""))
+                    msgs = []
+                    for item in deduped:
+                        msgs_data = item.get("messages", {})
+                        if isinstance(msgs_data, str):
+                            try:
+                                msgs_data = json.loads(msgs_data)
+                            except Exception:
+                                continue
+                        if isinstance(msgs_data, dict) and "messages" in msgs_data:
+                            msg_list = msgs_data["messages"]
+                        elif isinstance(msgs_data, list):
+                            msg_list = msgs_data
+                        else:
+                            msg_list = []
+                        for msg in msg_list:
+                            if isinstance(msg, dict):
+                                msgs.append(msg)
+                    if msgs:
+                        for m in msgs:
+                            if "timestamp" not in m:
+                                m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                        st.session_state.messages = msgs
+                        logger.info(f"✅ 聊天框渲染 {len(msgs)} 条消息")
+            except Exception as e:
+                logger.warning(f"聊天框加载失败: {e}")
 
-    # messages 为空，尝试从 OSS 加载历史对话渲染到聊天框
-    try:
-        lines = read_oss_full()
-        if not lines:
-            lines = read_oss_tail()
+        # 模型上文：累积摘要 + 当前 session 最近5轮
+        try:
+            cumulative = get_cumulative_summary_from_oss()
+            if cumulative:
+                st.session_state.cached_summary = cumulative
+                result["summary_restored"] = True
 
-        if lines:
-            seen = set()
-            deduped = []
-            for item in lines:
-                if not isinstance(item, dict):
-                    continue
-                key = (item.get("session_id"), item.get("round_num"))
-                if key in seen or key[0] is None or key[1] is None:
-                    continue
-                seen.add(key)
-                deduped.append(item)
-
-            deduped.sort(key=lambda x: x.get("ts", ""))
-
-            msgs = []
-            for item in deduped:
-                msgs_data = item.get("messages", {})
-                if isinstance(msgs_data, str):
-                    try:
-                        msgs_data = json.loads(msgs_data)
-                    except Exception:
-                        continue
-                if isinstance(msgs_data, dict) and "messages" in msgs_data:
-                    msg_list = msgs_data["messages"]
-                elif isinstance(msgs_data, list):
-                    msg_list = msgs_data
-                else:
-                    msg_list = []
-                for msg in msg_list:
-                    if isinstance(msg, dict):
-                        msgs.append(msg)
-
-            if msgs:
-                for m in msgs:
-                    if "timestamp" not in m:
-                        m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state.messages = msgs
-                result["success"] = True
-                result["rounds"] = len([m for m in msgs if m.get("role") == "user"])
+            recent_msgs = get_recent_messages_from_oss(
+                session_id=st.session_state.session_id, limit=5
+            )
+            if recent_msgs:
+                rounds_count = len([m for m in recent_msgs if m.get("role") == "user"])
+                result["rounds"] = rounds_count
                 result["source"] = "OSS chat_history"
-                logger.info(f"✅ 从 OSS 渲染 {len(msgs)} 条消息到聊天框")
+                result["success"] = True
+            elif cumulative:
+                result["success"] = True
+                result["source"] = "OSS chat_summary_window"
             else:
                 result["success"] = True
-                result["rounds"] = 0
                 result["source"] = "无历史数据"
-        else:
-            result["success"] = True
-            result["rounds"] = 0
-            result["source"] = "无历史数据"
-    except Exception as e:
-        result["error"] = str(e)
-        logger.warning(f"OSS 加载历史对话失败: {e}")
+        except Exception as e:
+            result["error"] = str(e)
+            logger.warning(f"模型上文恢复失败: {e}")
 
-    # 加载累积摘要
-    try:
-        cumulative = get_cumulative_summary_from_oss()
-        if cumulative:
-            st.session_state.cached_summary = cumulative
-    except Exception:
-        pass
+        st.session_state.history_loaded = True
 
-    st.session_state.history_loaded = True
     return result
+
 
 
 # ================= 从 OSS 读取历史对话列表（侧边栏用） =================
@@ -1018,16 +1018,23 @@ with st.sidebar:
 
     # ---- 启动恢复状态 ----
     if restore_result.get("error"):
-        st.error(f"❌ 启动恢复失败: {restore_result['error']}")
-    elif restore_result.get("success") and restore_result.get("rounds", 0) > 0:
+        st.error(f"❌ 上文恢复失败: {restore_result['error']}")
+    elif restore_result.get("summary_restored") and restore_result.get("rounds", 0) > 0:
         st.success("✅ 上文恢复成功")
-        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话已恢复")
-        if restore_result.get("source"):
-            st.caption(f"📦 来源: {restore_result['source']}")
-    elif restore_result.get("success") and restore_result.get("rounds", 0) == 0:
-        st.caption("⏳ 暂无历史对话")
+        st.caption(f"📄 累积摘要已加载")
+        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话")
+        st.caption(f"📦 来源: {restore_result['source']}")
+    elif restore_result.get("summary_restored"):
+        st.success("✅ 上文恢复成功")
+        st.caption("📄 累积摘要已加载（无最近对话）")
+        st.caption(f"📦 来源: {restore_result['source']}")
+    elif restore_result.get("rounds", 0) > 0:
+        st.success("✅ 上文恢复成功")
+        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话")
+        st.caption(f"📦 来源: {restore_result['source']}")
     else:
-        st.caption("⏳ 尚未恢复上文")
+        st.caption("⏳ 暂无上文数据")
+
 
     # ---- 后加载状态 ----
     with _recovery_lock:
