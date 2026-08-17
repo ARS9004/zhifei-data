@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-智飞投研 · 云端轻量版 v1.6 (2026-08-17)
-- [v1.6] 修复 trigger_backup_and_restore 跨线程状态传递：改用 _recovery_store 替代 st.session_state
-- [v1.6] 侧边栏后加载状态从 _recovery_store 读取，解决异步线程无法写入 st.session_state 的问题
+智飞投研 · 云端轻量版 v1.7 (2026-08-17)
+- [v1.7] 砍掉全部 RDS 直连：启动恢复和后加载均走 OSS
+- [v1.7] init_session_on_startup 从 OSS chat_history.jsonl + chat_summary_window.json 恢复
+- [v1.7] trigger_backup_and_restore 从 OSS 读取旧会话数据
 """
 
 import os
@@ -14,7 +15,6 @@ import time
 import uuid
 import atexit
 import logging
-import sqlite3
 import threading
 import io
 import concurrent.futures
@@ -25,7 +25,6 @@ import streamlit as st
 import dashscope
 from dashscope import Application
 import oss2
-import pymysql
 import pytz
 from http import HTTPStatus
 from dotenv import load_dotenv
@@ -69,14 +68,6 @@ if not DASHSCOPE_API_KEY:
 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
-
-# ================= RDS 配置 =================
-RDS_HOST = get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com")
-RDS_PORT = int(get_secret_or_env("RDS_PORT", "rds.port", 3306))
-RDS_USER = get_secret_or_env("RDS_USER", "rds.user", "zhuanz1")
-RDS_PASSWORD = get_secret_or_env("RDS_PASSWORD", "rds.zhuanz1_2026")
-RDS_DATABASE = get_secret_or_env("RDS_DATABASE", "rds.database", "stock_db")
-RDS_CHAT_TABLE = "chat_memory"
 
 # ================= OSS 配置 =================
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
@@ -142,18 +133,6 @@ def estimate_tokens(text: str) -> int:
     return int(ch * 1.0 + (len(text) - ch) / 4)
 
 
-# ================= RDS 操作 =================
-def get_rds_connection():
-    return pymysql.connect(
-        host=RDS_HOST, port=RDS_PORT, user=RDS_USER,
-        password=RDS_PASSWORD, database=RDS_DATABASE,
-        charset='utf8mb4',
-        connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30
-    )
-
-
 # ================= get_or_create_session =================
 def get_or_create_session() -> str:
     if "session_id" not in st.session_state or not st.session_state.session_id:
@@ -200,8 +179,35 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
             time.sleep(delay * (attempt + 1))
 
 
-# ================= OSS 尾部读取 =================
+# ================= OSS 读取 =================
+def read_oss_full():
+    """读取完整 OSS 文件，返回所有行"""
+    try:
+        bucket = get_oss_client()
+        remote = OSS_PREFIX + OSS_FILENAME
+        result = oss_get_with_retry(bucket, remote, max_retry=2)
+        if result is None:
+            return []
+        content = result.read().decode('utf-8')
+
+        lines = []
+        for line in content.strip().split('\n'):
+            if not line.strip():
+                continue
+            try:
+                lines.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return lines
+    except oss2.exceptions.NoSuchKey:
+        return []
+    except Exception as e:
+        logger.warning(f"read_oss_full 失败: {e}")
+        return []
+
+
 def read_oss_tail(size=40960):
+    """读取 OSS 文件尾部"""
     try:
         bucket = get_oss_client()
         remote = OSS_PREFIX + OSS_FILENAME
@@ -240,32 +246,22 @@ def read_oss_tail(size=40960):
         return []
 
 
-def read_oss_full():
+def get_cumulative_summary_from_oss() -> str:
+    """读取累积摘要"""
     try:
         bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_FILENAME
+        remote = OSS_PREFIX + OSS_SUMMARY_WINDOW_FILE
         result = oss_get_with_retry(bucket, remote, max_retry=2)
         if result is None:
-            return []
-        content = result.read().decode('utf-8')
-
-        lines = []
-        for line in content.strip().split('\n'):
-            if not line.strip():
-                continue
-            try:
-                lines.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return lines
-    except oss2.exceptions.NoSuchKey:
-        return []
+            return ""
+        data = json.loads(result.read().decode('utf-8'))
+        return data.get("cumulative", "")
     except Exception as e:
-        logger.warning(f"read_oss_full 失败: {e}")
-        return []
+        logger.debug(f"读取累积摘要失败: {e}")
+        return ""
 
 
-# ================= get_recent_messages =================
+# ================= 从 OSS 恢复消息 =================
 def _filter_and_dedup(lines: List[Dict], session_id: str = None) -> List[Dict]:
     seen = set()
     result = []
@@ -282,7 +278,8 @@ def _filter_and_dedup(lines: List[Dict], session_id: str = None) -> List[Dict]:
     return result
 
 
-def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
+def get_recent_messages_from_oss(session_id: str = None, limit: int = 5) -> List[Dict]:
+    """从 OSS 读取指定 session 的最近 N 轮消息"""
     lines = read_oss_tail()
     if not lines:
         lines = read_oss_full()
@@ -328,21 +325,7 @@ def get_recent_messages(session_id: str = None, limit: int = 5) -> List[Dict]:
     return result
 
 
-def get_cumulative_summary_from_oss() -> str:
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_WINDOW_FILE
-        result = oss_get_with_retry(bucket, remote, max_retry=2)
-        if result is None:
-            return ""
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("cumulative", "")
-    except Exception as e:
-        logger.debug(f"读取累积摘要失败: {e}")
-        return ""
-
-
-# ================= 后加载 =================
+# ================= 后加载相关 =================
 SESSION_WINDOW_SIZE = 12
 
 def _read_summary_window():
@@ -362,6 +345,7 @@ def _read_summary_window():
         logger.warning(f"读取摘要窗口失败: {e}")
         return {"window": [], "cumulative": ""}, False
 
+
 def _save_summary_window(window, cumulative):
     try:
         bucket = get_oss_client()
@@ -380,6 +364,7 @@ def _save_summary_window(window, cumulative):
                 time.sleep(delay * (attempt + 1))
     except Exception as e:
         logger.warning(f"保存摘要窗口失败: {e}")
+
 
 def merge_cumulative(previous: str, new_summary: str) -> str:
     if not previous:
@@ -402,6 +387,7 @@ def merge_cumulative(previous: str, new_summary: str) -> str:
             delay *= 2
     return previous
 
+
 def generate_summary(messages: List[Dict]) -> str:
     if not messages:
         return ""
@@ -423,19 +409,16 @@ def generate_summary(messages: List[Dict]) -> str:
             delay *= 2
     return ""
 
+
 def trigger_backup_and_restore(old_session_id: str):
     """
-    网端后加载：从 RDS chat_memory 恢复旧会话的上文
-    状态通过 _recovery_store 传递给主线程（不写 st.session_state）
+    后加载：从 OSS 恢复旧会话的上文
+    状态通过 _recovery_store 传递给主线程
     """
-    # ================= 初始化后加载状态（写入 _recovery_store，不是 st.session_state） =================
     with _recovery_lock:
         _recovery_store["backup_status"] = {
-            "running": True,
-            "summary_restored": False,
-            "rounds_restored": 0,
-            "error": None,
-            "source": None
+            "running": True, "summary_restored": False,
+            "rounds_restored": 0, "error": None, "source": None
         }
 
     if not old_session_id:
@@ -446,26 +429,27 @@ def trigger_backup_and_restore(old_session_id: str):
             }
         return
 
-    conn = None
     try:
-        conn = get_rds_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT messages FROM chat_memory WHERE session_id = %s AND is_deleted = 0 ORDER BY ts ASC",
-            (old_session_id,)
-        )
-        rows = cursor.fetchall()
+        # 从 OSS 读取旧会话全部消息
+        all_lines = read_oss_full()
+        if not all_lines:
+            all_lines = read_oss_tail()
+
+        old_lines = [l for l in all_lines if l.get("session_id") == old_session_id]
+        old_lines.sort(key=lambda x: x.get("ts", ""))
 
         all_messages = []
-        for (messages_json,) in rows:
-            try:
-                data = json.loads(messages_json)
-                if isinstance(data, dict) and "messages" in data:
-                    all_messages.extend(data.get("messages", []))
-                elif isinstance(data, list):
-                    all_messages.extend(data)
-            except Exception:
-                pass
+        for item in old_lines:
+            msgs_data = item.get("messages", {})
+            if isinstance(msgs_data, str):
+                try:
+                    msgs_data = json.loads(msgs_data)
+                except Exception:
+                    continue
+            if isinstance(msgs_data, dict) and "messages" in msgs_data:
+                all_messages.extend(msgs_data["messages"])
+            elif isinstance(msgs_data, list):
+                all_messages.extend(msgs_data)
 
         if not all_messages:
             with _recovery_lock:
@@ -510,7 +494,7 @@ def trigger_backup_and_restore(old_session_id: str):
                 _recovery_store["backup_status"] = {
                     "running": False, "summary_restored": summary_restored,
                     "rounds_restored": rounds_restored, "error": None,
-                    "source": "RDS chat_memory"
+                    "source": "OSS chat_history"
                 }
             return
 
@@ -540,19 +524,16 @@ def trigger_backup_and_restore(old_session_id: str):
             _recovery_store["backup_status"] = {
                 "running": False, "summary_restored": summary_restored,
                 "rounds_restored": rounds_restored, "error": None,
-                "source": "RDS chat_memory"
+                "source": "OSS chat_history"
             }
 
     except Exception as e:
-        logger.warning(f"网端后加载失败: {e}")
+        logger.warning(f"后加载失败: {e}")
         with _recovery_lock:
             _recovery_store["backup_status"] = {
                 "running": False, "summary_restored": False,
                 "rounds_restored": 0, "error": str(e), "source": None
             }
-    finally:
-        if conn:
-            conn.close()
 
 
 # ================= sync_to_oss =================
@@ -789,10 +770,10 @@ def export_docx(messages):
     return buffer
 
 
-# ================= 启动初始化 =================
+# ================= 启动初始化（从 OSS 恢复） =================
 def init_session_on_startup():
     """
-    云端启动初始化，从 RDS 恢复历史对话
+    云端启动初始化，从 OSS chat_history.jsonl 恢复历史对话
     返回恢复结果字典，供侧边栏显示
     """
     result = {"success": False, "rounds": 0, "error": None, "source": None}
@@ -810,38 +791,19 @@ def init_session_on_startup():
 
         msgs = []
         try:
-            conn = get_rds_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT messages FROM chat_memory WHERE session_id = %s AND is_deleted = 0 ORDER BY ts DESC LIMIT 5",
-                (session_id,)
-            )
-            rows = cursor.fetchall()
-            conn.close()
-            for (messages_json,) in reversed(rows):
-                try:
-                    data = json.loads(messages_json)
-                    if isinstance(data, dict) and "messages" in data:
-                        for msg in data.get("messages", []):
-                            if isinstance(msg, dict):
-                                msgs.append(msg)
-                    elif isinstance(data, list):
-                        for msg in data:
-                            if isinstance(msg, dict):
-                                msgs.append(msg)
-                except json.JSONDecodeError:
-                    continue
+            # 从 OSS 读取最近 5 轮对话
+            msgs = get_recent_messages_from_oss(session_id=session_id, limit=5)
             if msgs:
-                logger.info(f"✅ 从 RDS chat_memory 恢复 {len(msgs)} 条消息")
+                logger.info(f"✅ 从 OSS chat_history 恢复 {len(msgs)} 条消息")
         except Exception as e:
             result["error"] = str(e)
-            logger.warning(f"RDS 恢复失败: {e}")
+            logger.warning(f"OSS 恢复失败: {e}")
 
         if msgs:
             rounds_count = len([m for m in msgs if m.get("role") == "user"])
             result["success"] = True
             result["rounds"] = rounds_count
-            result["source"] = "RDS chat_memory"
+            result["source"] = "OSS chat_history"
 
             for m in msgs:
                 if "timestamp" not in m:
@@ -853,6 +815,14 @@ def init_session_on_startup():
             result["success"] = True
             result["rounds"] = 0
             result["source"] = "无历史数据"
+
+        # 同时加载累积摘要
+        try:
+            cumulative = get_cumulative_summary_from_oss()
+            if cumulative:
+                st.session_state.cached_summary = cumulative
+        except Exception:
+            pass
 
         st.session_state.history_loaded = True
 
@@ -1026,7 +996,7 @@ with st.sidebar:
         else:
             st.caption("⏳ 暂无后加载数据")
 
-    # ---- OSS 写入状态（主线程，st.session_state 没问题） ----
+    # ---- OSS 写入状态 ----
     st.divider()
     st.caption("💾 OSS 同步状态")
     oss_status = st.session_state.get("oss_write_status", {})
