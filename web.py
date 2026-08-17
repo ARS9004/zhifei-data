@@ -158,7 +158,7 @@ def get_rds_connection():
     )
 
 
-# ================= 改动一：get_or_create_session（删掉 RDS 查表逻辑） =================
+# ================= get_or_create_session（删掉 RDS 查表逻辑） =================
 def get_or_create_session() -> str:
     if "session_id" not in st.session_state or not st.session_state.session_id:
         st.session_state.session_id = str(uuid.uuid4())
@@ -546,7 +546,7 @@ def trigger_backup_and_restore(old_session_id: str):
             conn.close()
 
 
-# ================= V8.0 正式版：sync_to_oss（改动二：删掉 remote_path 参数） =================
+# ================= V8.0 正式版：sync_to_oss =================
 def sync_to_oss(lines):
     # ================= 初始化 OSS 写入状态 =================
     st.session_state.oss_write_status = {"running": True, "success": False, "lines": 0, "error": None}
@@ -788,6 +788,12 @@ def export_docx(messages):
 
 # ================= 启动初始化 =================
 def init_session_on_startup():
+    """
+    云端启动初始化，从 RDS 恢复历史对话
+    返回恢复结果字典，供侧边栏显示
+    """
+    result = {"success": False, "rounds": 0, "error": None, "source": None}
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.history_loaded = False
@@ -829,25 +835,16 @@ def init_session_on_startup():
                 logger.info(f"✅ 从 RDS chat_memory 恢复 {len(msgs)} 条消息")
                 print(f"🔍 init_session_on_startup: RDS 恢复 {len(msgs)} 条")
         except Exception as e:
+            result["error"] = str(e)
             logger.warning(f"RDS 恢复失败: {e}")
             print(f"🔍 init_session_on_startup: RDS 恢复失败: {e}")
 
         if msgs:
             rounds_count = len([m for m in msgs if m.get("role") == "user"])
-            st.session_state.rds_restore_status = {
-                "running": False,
-                "success": True,
-                "rounds": rounds_count,
-                "source": "RDS chat_memory (启动恢复)",
-                "error": None
-           }
-            st.session_state.restore_status = {
-                "running": False,
-                "summary_restored": False,
-                "rounds_restored": len([m for m in msgs if m.get("role") == "user"]),
-                "error": None,
-                "source": "RDS chat_memory (启动恢复)"
-            }
+            result["success"] = True
+            result["rounds"] = rounds_count
+            result["source"] = "RDS chat_memory"
+
             for m in msgs:
                 if "timestamp" not in m:
                     m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -855,15 +852,29 @@ def init_session_on_startup():
             st.session_state.messages = msgs
             logger.info(f"✅ 恢复 {len(msgs)} 条消息（session: {session_id}）")
             print(f"🔍 init_session_on_startup: 最终恢复 {len(msgs)} 条消息")
+        else:
+            # 没有数据，也算成功（只是0轮）
+            result["success"] = True
+            result["rounds"] = 0
+            result["source"] = "无历史数据"
 
         st.session_state.history_loaded = True
+
+    # 如果已有 messages（缓存命中），直接从 st.session_state 计算
+    if st.session_state.messages and not result["success"]:
+        result["success"] = True
+        result["rounds"] = len([m for m in st.session_state.messages if m.get("role") == "user"])
+        result["source"] = "已缓存"
+
+    return result
 
 
 # ================= UI (终极稳定版) =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("📱 智飞投研")
 
-init_session_on_startup()
+# 启动初始化，拿到恢复结果
+restore_result = init_session_on_startup()
 
 if "generating" not in st.session_state:
     st.session_state.generating = False
@@ -987,43 +998,20 @@ with col3:
 with st.sidebar:
     st.subheader("📋 系统状态")
 
-    # ===== 恢复状态：直接从 messages 计算 =====
-    msgs = st.session_state.get("messages", [])
-    user_msgs = [m for m in msgs if m.get("role") == "user"]
-    rounds_restored = len(user_msgs)
-    has_summary = bool(st.session_state.get("cached_summary") or st.session_state.get("restore_status", {}).get("summary_restored"))
-
-    if rounds_restored > 0:
+    # RDS 恢复状态（直接用 restore_result 返回值）
+    if restore_result.get("error"):
+        st.error(f"❌ 恢复失败: {restore_result['error']}")
+    elif restore_result.get("success") and restore_result.get("rounds", 0) > 0:
         st.success("✅ 上文恢复成功")
-        st.caption(f"💬 最近 {rounds_restored} 轮对话已恢复")
-        if has_summary:
-            st.caption("📄 摘要已恢复")
-        st.caption("📦 来源: RDS chat_memory")
-    else:
-        # 检查是否正在恢复
-        restore_status = st.session_state.get("restore_status", {})
-        if restore_status.get("running"):
-            st.info("⏳ 正在恢复上文...")
-        elif restore_status.get("error"):
-            st.error(f"❌ 恢复失败: {restore_status['error']}")
-        else:
-            st.caption("⏳ 尚未恢复上文")
-
-# ===== RDS 恢复状态 =====
-    rds_status = st.session_state.get("rds_restore_status", {})
-    if rds_status.get("running"):
-        st.info("⏳ 正在恢复上文...")
-    elif rds_status.get("success"):
-        st.success(f"✅ 上文恢复成功")
-    if rds_status.get("rounds", 0) > 0:
-        st.caption(f"💬 最近 {rds_status['rounds']} 轮对话已恢复")
-    if rds_status.get("source"):
-        st.caption(f"📦 来源: {rds_status['source']}")
-    elif rds_status.get("error"):
-        st.error(f"❌ 恢复失败: {rds_status['error']}")
+        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话已恢复")
+        if restore_result.get("source"):
+            st.caption(f"📦 来源: {restore_result['source']}")
+    elif restore_result.get("success") and restore_result.get("rounds", 0) == 0:
+        st.caption("⏳ 暂无历史对话")
     else:
         st.caption("⏳ 尚未恢复上文")
-    # ===== OSS 写入状态 =====
+
+    # OSS 写入状态
     oss_status = st.session_state.get("oss_write_status", {})
     if oss_status.get("running"):
         st.info("⏳ 正在写入 OSS...")
