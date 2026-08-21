@@ -1,4 +1,4 @@
-	#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 智飞投研 · 本地完整版 v2.1 (2026-08-21)
