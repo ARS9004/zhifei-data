@@ -1,29 +1,24 @@
-#!/usr/bin/env python3
+	#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-智飞投研 · 云端轻量版 v1.9 (2026-08-17)
-- [v1.9] 修复 OSS_SUMMARY_WINDOW_FILE 文件名 chat_summary.json → chat_summary.jsonl
-- [v1.9] 修复侧边栏判断逻辑，不依赖不存在的 summary_restored 字段
-- [v1.9] 聊天框历史对话永久保留，不清空
-- [v1.9] 新建会话不清空 messages
-- [v1.9] 侧边栏新增历史对话列表 + 清空按钮
-- [v1.9] 上文恢复从 OSS chat_memory.jsonl + chat_summary.jsonl
+智飞投研 · 本地完整版 v2.1 (2026-08-21)
+- [v2.1] 整合侧边栏业务功能：分析方案、快捷工具、Token监控
+- [v2.1] 增加侧边栏快捷指令的快捷输入响应
+- [v2.0] 分离 display_messages(渲染) 和 messages(模型上下文)
+- [v2.0] 聊天框历史对话永久保留，新建会话不清空
+- [v2.0] 新会话只发恢复指令给模型，不携带历史消息
 """
-
+ 
 import os
 import re
 import json
 import time
 import uuid
-import atexit
 import logging
-import threading
 import io
-import concurrent.futures
 from datetime import datetime
 from typing import List, Dict
-
+ 
 import streamlit as st
 import dashscope
 from dashscope import Application
@@ -33,21 +28,16 @@ from http import HTTPStatus
 from dotenv import load_dotenv
 from aliyunsdkcore.client import AcsClient
 from aliyunsdksts.request.v20150401 import AssumeRoleRequest
-
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
-
+ 
+import core_engine
+ 
 load_dotenv()
-
-_backup_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="backup")
-atexit.register(_backup_executor.shutdown, wait=False)
-
-_recovery_store = {}
-_recovery_lock = threading.Lock()
-
+ 
 _CHINESE_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
-
+ 
 def get_secret_or_env(key, secrets_key=None, default=None):
     if secrets_key:
         parts = secrets_key.split('.')
@@ -60,43 +50,51 @@ def get_secret_or_env(key, secrets_key=None, default=None):
         except Exception:
             pass
     return os.getenv(key, default)
-
-
+ 
 DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY:
-    raise RuntimeError("⛔ 请配置 DASHSCOPE_API_KEY")
-
+    raise RuntimeError("请配置 DASHSCOPE_API_KEY")
+ 
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
-
+ 
 OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
 OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
 OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "chat_history/")
 OSS_FILENAME = "chat_memory.jsonl"
-OSS_SUMMARY_WINDOW_FILE = "chat_summary.jsonl"
+ 
 OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
 OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
-
 if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET:
-    raise RuntimeError("⛔ 请配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
-
+    raise RuntimeError("请配置 OSS_ACCESS_KEY_ID 和 OSS_ACCESS_KEY_SECRET")
+ 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
-_FAIL_LOCK = threading.Lock()
+ 
+# ================= 辅助函数 =================
+def now_ts_display():
+    return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+ 
+def is_one_click_scheme(scheme_name):
+    # 简易判断逻辑，可根据实际业务扩充
+    return scheme_name in ["A盘前快速分析", "B产业链扫描", "每日简报", "投研周报"]
+ 
+def get_scheme_prompt(scheme_name):
+    # 占位实现，返回对应的 Prompt 模板
+    return f"请执行【{scheme_name}】分析方案"
+ 
+# ================= 前端熔断机制 =================
+_FAIL_LOCK = __import__('threading').Lock()
 _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
 _MODEL_HEALTHY = True
 _MAX_CONSECUTIVE_FAILURES = {"network": 5, "api": 3, "model": 3}
-
-
+ 
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     with _FAIL_LOCK:
         _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
         _MODEL_HEALTHY = True
-
-
+ 
 def mark_failure(error_type: str):
     global _FAIL_COUNTER, _MODEL_HEALTHY
     if error_type not in _FAIL_COUNTER:
@@ -105,14 +103,12 @@ def mark_failure(error_type: str):
         _FAIL_COUNTER[error_type] += 1
         if error_type == "model" and _FAIL_COUNTER["model"] >= _MAX_CONSECUTIVE_FAILURES["model"]:
             _MODEL_HEALTHY = False
-            logger.warning("⛔ 模型服务熔断：连续 %d 次模型调用失败", _FAIL_COUNTER["model"])
-
-
+            logger.warning("模型服务熔断：连续 %d 次模型调用失败", _FAIL_COUNTER["model"])
+ 
 def is_model_healthy() -> bool:
     with _FAIL_LOCK:
         return _MODEL_HEALTHY
-
-
+ 
 def _classify_error(e: Exception) -> str:
     err_str = str(e).lower()
     if not err_str:
@@ -122,22 +118,14 @@ def _classify_error(e: Exception) -> str:
     if any(kw in err_str for kw in ["rate", "quota", "throttle", "limit", "429"]):
         return "api"
     return "model"
-
-
+ 
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     ch = len(_CHINESE_CHAR_RE.findall(text))
     return int(ch * 1.0 + (len(text) - ch) / 4)
-
-
-def get_or_create_session() -> str:
-    if "session_id" not in st.session_state or not st.session_state.session_id:
-        st.session_state.session_id = str(uuid.uuid4())
-    return st.session_state.session_id
-
-
-# ================= OSS 客户端 =================
+ 
+# ================= OSS 客户端 (前端使用 STS 临时凭证) =================
 def get_oss_client():
     client = AcsClient(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_REGION)
     req = AssumeRoleRequest.AssumeRoleRequest()
@@ -148,8 +136,7 @@ def get_oss_client():
     creds = json.loads(resp)["Credentials"]
     auth = oss2.StsAuth(creds["AccessKeyId"], creds["AccessKeySecret"], creds["SecurityToken"])
     return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
-
-
+ 
 def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
     for attempt in range(max_retry):
         try:
@@ -161,8 +148,7 @@ def oss_get_with_retry(bucket, remote_path, max_retry=3, delay=1, **kwargs):
                 raise
             logger.warning(f"OSS 读取重试 {attempt+1}/{max_retry}: {e}")
             time.sleep(delay * (attempt + 1))
-
-
+ 
 def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
     for attempt in range(max_retry):
         try:
@@ -174,8 +160,7 @@ def oss_head_with_retry(bucket, remote_path, max_retry=3, delay=1):
                 raise
             logger.warning(f"OSS head 重试 {attempt+1}/{max_retry}: {e}")
             time.sleep(delay * (attempt + 1))
-
-
+ 
 def read_oss_full():
     try:
         bucket = get_oss_client()
@@ -198,8 +183,7 @@ def read_oss_full():
     except Exception as e:
         logger.warning(f"read_oss_full 失败: {e}")
         return []
-
-
+ 
 def read_oss_tail(size=40960):
     try:
         bucket = get_oss_client()
@@ -233,605 +217,14 @@ def read_oss_tail(size=40960):
     except Exception as e:
         logger.debug(f"read_oss_tail 失败: {e}")
         return []
-
-
-def get_cumulative_summary_from_oss() -> str:
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_WINDOW_FILE
-        result = oss_get_with_retry(bucket, remote, max_retry=2)
-        if result is None:
-            return ""
-        data = json.loads(result.read().decode('utf-8'))
-        return data.get("cumulative", "")
-    except Exception as e:
-        logger.debug(f"读取累积摘要失败: {e}")
-        return ""
-
-
-# ================= 后加载 =================
-SESSION_WINDOW_SIZE = 12
-
-def _read_summary_window():
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_WINDOW_FILE
-        result = oss_get_with_retry(bucket, remote, max_retry=2)
-        if result is None:
-            return {"window": [], "cumulative": ""}, True
-        data = json.loads(result.read().decode('utf-8'))
-        data.setdefault("window", [])
-        data.setdefault("cumulative", "")
-        return data, True
-    except oss2.exceptions.NoSuchKey:
-        return {"window": [], "cumulative": ""}, True
-    except Exception as e:
-        logger.warning(f"读取摘要窗口失败: {e}")
-        return {"window": [], "cumulative": ""}, False
-
-
-def _save_summary_window(window, cumulative):
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_SUMMARY_WINDOW_FILE
-        data = {"window": window, "cumulative": cumulative}
-        content = json.dumps(data, ensure_ascii=False).encode('utf-8')
-        retries, delay = 2, 1
-        for attempt in range(retries):
-            try:
-                bucket.put_object(remote, content)
-                return
-            except Exception as e:
-                if attempt == retries - 1:
-                    raise
-                logger.warning(f"_save_summary_window 重试 {attempt+1}/{retries}: {e}")
-                time.sleep(delay * (attempt + 1))
-    except Exception as e:
-        logger.warning(f"保存摘要窗口失败: {e}")
-
-
-def merge_cumulative(previous: str, new_summary: str) -> str:
-    if not previous:
-        return new_summary
-    retries, delay = 2, 1
-    for attempt in range(retries):
-        try:
-            prompt = f"将以下两份摘要合并为一份200字以内的整体摘要：\n{previous}\n---\n{new_summary}"
-            dashscope.api_key = DASHSCOPE_API_KEY
-            resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-            if resp.status_code == HTTPStatus.OK and resp.output.choices:
-                return resp.output.choices[0].message.content
-            else:
-                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
-        except Exception as e:
-            if attempt == retries - 1:
-                logger.warning(f"merge_cumulative 失败，回退到 previous: {e}")
-                return previous
-            time.sleep(delay)
-            delay *= 2
-    return previous
-
-
-def generate_summary(messages: List[Dict]) -> str:
-    if not messages:
-        return ""
-    retries, delay = 2, 1
-    for attempt in range(retries):
-        try:
-            prompt = f"将以下对话压缩成300字摘要，突出核心标的、数据和结论：\n{json.dumps(messages, ensure_ascii=False)[:5000]}"
-            dashscope.api_key = DASHSCOPE_API_KEY
-            resp = dashscope.Generation.call(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}], result_format="message")
-            if resp.status_code == HTTPStatus.OK and resp.output.choices:
-                return resp.output.choices[0].message.content
-            else:
-                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
-        except Exception as e:
-            if attempt == retries - 1:
-                logger.warning(f"generate_summary 失败: {e}")
-                return ""
-            time.sleep(delay)
-            delay *= 2
-    return ""
-
-
-def trigger_backup_and_restore(old_session_id: str):
-    """
-    后加载：从 OSS 恢复旧会话上文给模型
-    """
-    with _recovery_lock:
-        _recovery_store["backup_status"] = {
-            "running": True, "summary_restored": False,
-            "rounds_restored": 0, "error": None, "source": None
-        }
-
-    if not old_session_id:
-        with _recovery_lock:
-            _recovery_store["backup_status"] = {
-                "running": False, "summary_restored": False,
-                "rounds_restored": 0, "error": "无旧会话ID", "source": None
-            }
-        return
-
-    try:
-        all_lines = read_oss_full()
-        if not all_lines:
-            all_lines = read_oss_tail()
-
-        old_lines = [l for l in all_lines if l.get("session_id") == old_session_id]
-        old_lines.sort(key=lambda x: x.get("ts", ""))
-
-        all_messages = []
-        for item in old_lines:
-            msgs_data = item.get("messages", {})
-            if isinstance(msgs_data, str):
-                try:
-                    msgs_data = json.loads(msgs_data)
-                except Exception:
-                    continue
-            if isinstance(msgs_data, dict) and "messages" in msgs_data:
-                all_messages.extend(msgs_data["messages"])
-            elif isinstance(msgs_data, list):
-                all_messages.extend(msgs_data)
-
-        if not all_messages:
-            with _recovery_lock:
-                _recovery_store["backup_status"] = {
-                    "running": False, "summary_restored": False,
-                    "rounds_restored": 0, "error": "旧会话无有效消息", "source": None
-                }
-            return
-
-        summary = generate_summary(all_messages)
-        summary_restored = bool(summary)
-        last_3_rounds = all_messages[-6:]
-        rounds_restored = len(last_3_rounds) // 2 if last_3_rounds else 0
-
-        hint_parts = []
-        if summary:
-            hint_parts.append(f"【历史对话摘要】{summary}")
-        if last_3_rounds:
-            recent_text = []
-            for msg in last_3_rounds:
-                role = "用户" if msg.get("role") == "user" else "助手"
-                content = str(msg.get("content", ""))[:200]
-                recent_text.append(f"{role}: {content}")
-            if recent_text:
-                hint_parts.append("【最近对话】\n" + "\n".join(recent_text))
-
-        data, read_ok = _read_summary_window()
-        window = data.get("window", [])
-        cumulative = data.get("cumulative", "")
-
-        if not read_ok:
-            if "cached_summary" in st.session_state and st.session_state.cached_summary:
-                new_cumulative = merge_cumulative(st.session_state.cached_summary, summary)
-            else:
-                new_cumulative = summary
-            with _recovery_lock:
-                _recovery_store["cached_summary"] = new_cumulative
-            if hint_parts:
-                with _recovery_lock:
-                    _recovery_store["pending"] = "\n\n".join(hint_parts)
-            with _recovery_lock:
-                _recovery_store["backup_status"] = {
-                    "running": False, "summary_restored": summary_restored,
-                    "rounds_restored": rounds_restored, "error": None,
-                    "source": "chat_memory.jsonl"
-                }
-            return
-
-        if not window and not cumulative:
-            if "cached_summary" in st.session_state and st.session_state.cached_summary:
-                cumulative = st.session_state.cached_summary
-
-        existing_sids = [w.get("session_id") for w in window]
-        if old_session_id not in existing_sids:
-            cumulative = merge_cumulative(cumulative, summary)
-            window.append({
-                "session_id": old_session_id,
-                "summary": summary,
-                "created_at": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-            })
-            if len(window) > SESSION_WINDOW_SIZE:
-                window = window[-SESSION_WINDOW_SIZE:]
-            _save_summary_window(window, cumulative)
-            with _recovery_lock:
-                _recovery_store["cached_summary"] = cumulative
-
-        if hint_parts:
-            with _recovery_lock:
-                _recovery_store["pending"] = "\n\n".join(hint_parts)
-
-        with _recovery_lock:
-            _recovery_store["backup_status"] = {
-                "running": False, "summary_restored": summary_restored,
-                "rounds_restored": rounds_restored, "error": None,
-                "source": "chat_memory.jsonl"
-            }
-
-    except Exception as e:
-        logger.warning(f"后加载失败: {e}")
-        with _recovery_lock:
-            _recovery_store["backup_status"] = {
-                "running": False, "summary_restored": False,
-                "rounds_restored": 0, "error": str(e), "source": None
-            }
-
-
-# ================= sync_to_oss =================
-def sync_to_oss(lines):
-    st.session_state.oss_write_status = {"running": True, "success": False, "lines": 0, "error": None}
-
-    try:
-        bucket = get_oss_client()
-        remote = OSS_PREFIX + OSS_FILENAME
-        content = "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n"
-        content_bytes = content.encode('utf-8')
-
-        try:
-            meta = bucket.head_object(remote)
-            if meta.headers.get('x-oss-object-type') != 'Appendable':
-                logger.warning("⚠️ OSS 文件为 Normal 类型，正在迁移为 Appendable...")
-                existing = read_oss_full()
-                all_lines = existing + lines
-                all_content = "\n".join(json.dumps(l, ensure_ascii=False) for l in all_lines) + "\n"
-                tmp_remote = remote + '.tmp'
-                bucket.put_object(tmp_remote, all_content.encode('utf-8'))
-                bucket.delete_object(remote)
-                bucket.append_object(remote, 0, all_content.encode('utf-8'))
-                bucket.delete_object(tmp_remote)
-            else:
-                pos = meta.content_length
-                bucket.append_object(remote, pos, content_bytes)
-        except oss2.exceptions.NoSuchKey:
-            bucket.append_object(remote, 0, content_bytes)
-
-        logger.info(f"✅ OSS 追加写入成功: {len(lines)} 行")
-        st.session_state.oss_write_status["success"] = True
-        st.session_state.oss_write_status["lines"] = len(lines)
-        st.session_state.oss_write_status["running"] = False
-        return len(lines)
-    except Exception as e:
-        logger.error(f"❌ OSS 追加写入失败: {e}")
-        st.session_state.oss_write_status["error"] = str(e)
-        st.session_state.oss_write_status["running"] = False
-        raise
-
-
-# ================= 模型调用 =================
-def _clean_for_api(raw_msgs: List[Dict]) -> List[Dict]:
-    valid = []
-    for m in raw_msgs:
-        role = m.get("role", "")
-        content = m.get("content")
-        if role not in ("user", "assistant"):
-            continue
-        if content is None or str(content).strip() == "":
-            continue
-        valid.append({"role": role, "content": str(content).strip()})
-
-    if not valid:
-        return []
-
-    while valid and valid[0]["role"] != "user":
-        valid.pop(0)
-
-    cleaned = [valid[0]] if valid else []
-    for m in valid[1:]:
-        if m["role"] != cleaned[-1]["role"]:
-            cleaned.append(m)
-
-    while cleaned and cleaned[-1]["role"] != "user":
-        cleaned.pop()
-
-    return cleaned
-
-
-def _extract_text_from_response(resp) -> str:
-    output = resp.output
-
-    text = getattr(output, 'text', None)
-    if text and isinstance(text, str) and text.strip():
-        return text
-
-    choices = getattr(output, 'choices', None)
-    if choices and isinstance(choices, list) and len(choices) > 0:
-        msg = getattr(choices[0], 'message', None)
-        if msg:
-            content = getattr(msg, 'content', None)
-            if content and isinstance(content, str) and content.strip():
-                return content
-        assistant = getattr(choices[0], 'assistant', None)
-        if assistant:
-            if isinstance(assistant, dict):
-                content = assistant.get('content') or assistant.get('text')
-                if content and isinstance(content, str) and content.strip():
-                    return content
-            elif isinstance(assistant, str) and assistant.strip():
-                return assistant
-
-    if isinstance(output, str) and output.strip():
-        return output
-
-    if isinstance(output, dict):
-        text = output.get('text')
-        if not (text and isinstance(text, str) and text.strip()):
-            text = output.get('content')
-        if text and isinstance(text, str) and text.strip():
-            return text
-
-    assistant = getattr(output, 'assistant', None)
-    if assistant:
-        if isinstance(assistant, dict):
-            text = assistant.get('content') or assistant.get('text')
-            if text and isinstance(text, str) and text.strip():
-                return text
-        elif isinstance(assistant, str) and assistant.strip():
-            return assistant
-
-    return ""
-
-
-def call_bailian(messages: List[Dict]) -> str:
-    if not is_model_healthy():
-        raise RuntimeError("服务暂时不可用")
-    dashscope.api_key = DASHSCOPE_API_KEY
-
-    if st.session_state.get("is_restoring"):
-        for _ in range(20):
-            with _recovery_lock:
-                if "pending" in _recovery_store:
-                    break
-            time.sleep(0.5)
-        st.session_state.is_restoring = False
-
-    with _recovery_lock:
-        recovery_ctx = _recovery_store.pop("pending", None)
-        cached_summary = _recovery_store.pop("cached_summary", None)
-
-    if cached_summary is not None:
-        st.session_state.cached_summary = cached_summary
-
-    context_text = ""
-    if recovery_ctx:
-        context_text = f"【历史投研记录，仅供参考】\n{recovery_ctx}\n\n---\n\n"
-    else:
-        summary = get_cumulative_summary_from_oss()
-        if summary:
-            context_text = f"【历史对话摘要】\n{summary}\n\n---\n\n"
-
-    cleaned = _clean_for_api(messages)
-    if not cleaned:
-        raise RuntimeError("上下文中没有有效的用户消息")
-
-    if context_text and cleaned:
-        first_user_content = context_text + cleaned[0]['content']
-        cleaned[0] = {"role": "user", "content": first_user_content}
-
-    full_msgs = cleaned
-
-    BAILIAN_APP_ID = "45db2f797bfd49229f757b04ed13ac92"
-
-    retries, delay = 3, 2
-    for attempt in range(retries):
-        try:
-            resp = Application.call(
-                app_id=BAILIAN_APP_ID,
-                messages=full_msgs,
-                stream=False
-            )
-            if resp.status_code == HTTPStatus.OK:
-                full_text = _extract_text_from_response(resp)
-                if not full_text or not full_text.strip():
-                    raise RuntimeError("模型返回内容为空")
-
-                reset_health_status()
-                return full_text
-            else:
-                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
-        except Exception as e:
-            err_type = _classify_error(e)
-            if attempt == retries - 1:
-                mark_failure(err_type)
-                raise RuntimeError(f"模型连续{retries}次调用失败: {e}")
-            logger.warning(f"call_bailian 重试 {attempt+1}/{retries} [{err_type}]: {e}")
-            time.sleep(delay)
-            delay *= 2
-    raise RuntimeError("未知错误")
-
-
-def call_bailian_with_token_check(messages: List[Dict]) -> str:
-    MAX_INPUT_TOKENS = 16000
-    SYSTEM_PROMPT_RESERVE = 2500
-
-    total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
-    if total_tokens > MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE:
-        logger.warning(f"⚠️ 输入超长 ({total_tokens} tokens)，自动截断最近消息")
-        trimmed = []
-        running_tokens = 0
-        limit = MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE
-        for m in reversed(messages):
-            t = estimate_tokens(str(m.get("content", "")))
-            if running_tokens + t > limit:
-                break
-            trimmed.insert(0, m)
-            running_tokens += t
-        messages = trimmed
-        logger.info(f"✅ 截断后 {len(messages)} 条消息，~{running_tokens} tokens")
-
-    return call_bailian(messages)
-
-
-def export_docx(messages):
-    doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = '仿宋'
-    style.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
-
-    title = doc.add_heading('', level=1)
-    title_run = title.add_run("智飞投研对话记录")
-    title_run.font.name = '仿宋'
-    title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
-    title_run.font.size = Pt(16)
-    title_run.font.bold = True
-
-    for m in messages:
-        role = "用户" if m.get("role") == "user" else "助手"
-        content = m.get("content") or ""
-        ts = m.get("timestamp", "")[:16]
-        prefix = f"[{ts}] " if ts else ""
-        para = doc.add_paragraph()
-        run = para.add_run(f"{prefix}{role}：{content}")
-        run.font.name = '仿宋'
-        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
-        run.font.size = Pt(14)
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer
-
-
-# ================= 启动初始化 =================
-def init_session_on_startup():
-    """
-    启动初始化：
-    - 聊天框：messages 为空时从 OSS 加载全部历史对话（只加载一次，之后不清空）
-    - 模型上文：从 chat_memory.jsonl 取最近5轮 + 从 chat_summary.jsonl 取累积摘要
-    """
-    result = {"success": False, "rounds": 0, "error": None, "source": None}
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "history_loaded" not in st.session_state:
-        st.session_state.history_loaded = False
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = ""
-    if "cached_summary" not in st.session_state:
-        st.session_state.cached_summary = ""
-    if "render_offset" not in st.session_state:
-        st.session_state.render_offset = 0
-
-    if not st.session_state.session_id:
-        st.session_state.session_id = str(uuid.uuid4())
-
-    if not st.session_state.history_loaded:
-        # 聊天框：messages 为空时从 OSS 加载一次
-        if not st.session_state.messages:
-            try:
-                lines = read_oss_full()
-                if not lines:
-                    lines = read_oss_tail()
-                if lines:
-                    seen = set()
-                    deduped = []
-                    for item in lines:
-                        if not isinstance(item, dict):
-                            continue
-                        key = (item.get("session_id"), item.get("round_num"))
-                        if key in seen or key[0] is None or key[1] is None:
-                            continue
-                        seen.add(key)
-                        deduped.append(item)
-                    deduped.sort(key=lambda x: x.get("ts", ""))
-                    msgs = []
-                    for item in deduped:
-                        msgs_data = item.get("messages", {})
-                        if isinstance(msgs_data, str):
-                            try:
-                                msgs_data = json.loads(msgs_data)
-                            except Exception:
-                                continue
-                        if isinstance(msgs_data, dict) and "messages" in msgs_data:
-                            msg_list = msgs_data["messages"]
-                        elif isinstance(msgs_data, list):
-                            msg_list = msgs_data
-                        else:
-                            msg_list = []
-                        for msg in msg_list:
-                            if isinstance(msg, dict):
-                                msgs.append(msg)
-                    if msgs:
-                        for m in msgs:
-                            if "timestamp" not in m:
-                                m["timestamp"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                        st.session_state.messages = msgs
-            except Exception as e:
-                logger.warning(f"聊天框加载失败: {e}")
-
-        # 模型上文：从 chat_memory.jsonl 取最近5轮
-        recent_msgs = []
-        try:
-            lines = read_oss_tail()
-            if not lines:
-                lines = read_oss_full()
-            if lines:
-                seen = set()
-                deduped = []
-                for item in lines:
-                    if not isinstance(item, dict):
-                        continue
-                    key = (item.get("session_id"), item.get("round_num"))
-                    if key in seen or key[0] is None or key[1] is None:
-                        continue
-                    seen.add(key)
-                    deduped.append(item)
-                deduped.sort(key=lambda x: x.get("ts", ""), reverse=True)
-                recent = deduped[:5]
-                for item in reversed(recent):
-                    msgs_data = item.get("messages", {})
-                    if isinstance(msgs_data, str):
-                        try:
-                            msgs_data = json.loads(msgs_data)
-                        except Exception:
-                            continue
-                    if isinstance(msgs_data, dict) and "messages" in msgs_data:
-                        msg_list = msgs_data["messages"]
-                    elif isinstance(msgs_data, list):
-                        msg_list = msgs_data
-                    else:
-                        msg_list = []
-                    for msg in msg_list:
-                        if isinstance(msg, dict):
-                            recent_msgs.append(msg)
-        except Exception as e:
-            result["error"] = str(e)
-            logger.warning(f"上文恢复失败: {e}")
-
-        # 累积摘要：从 chat_summary.jsonl
-        try:
-            cumulative = get_cumulative_summary_from_oss()
-            if cumulative:
-                st.session_state.cached_summary = cumulative
-        except Exception:
-            pass
-
-        if recent_msgs:
-            rounds_count = len([m for m in recent_msgs if m.get("role") == "user"])
-            result["success"] = True
-            result["rounds"] = rounds_count
-            result["source"] = "chat_memory.jsonl"
-            logger.info(f"✅ 模型上文恢复 {rounds_count} 轮对话")
-        else:
-            result["success"] = True
-            result["rounds"] = 0
-            result["source"] = "chat_memory.jsonl（无数据）"
-
-        st.session_state.history_loaded = True
-
-    return result
-
-
-# ================= 从 OSS 读取历史对话列表（侧边栏用） =================
+ 
 def get_history_sessions():
-    """返回按 session 分组的历史对话摘要列表"""
     try:
         lines = read_oss_full()
         if not lines:
             lines = read_oss_tail()
         if not lines:
             return []
-
         sessions = {}
         for item in lines:
             if not isinstance(item, dict):
@@ -853,41 +246,229 @@ def get_history_sessions():
                             break
                 sessions[sid] = {"session_id": sid, "title": title, "ts": ts, "rounds": 0}
             sessions[sid]["rounds"] += 1
-
         return sorted(sessions.values(), key=lambda x: x.get("ts", ""), reverse=True)
     except Exception:
         return []
+ 
+# ================= 百炼调用 =================
+def _clean_for_api(raw_msgs: List[Dict]) -> List[Dict]:
+    valid = []
+    for m in raw_msgs:
+        role = m.get("role", "")
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if content is None or str(content).strip() == "":
+            continue
+        valid.append({"role": role, "content": str(content).strip()})
+    if not valid:
+        return []
+    while valid and valid[0]["role"] != "user":
+        valid.pop(0)
+    cleaned = [valid[0]] if valid else []
+    for m in valid[1:]:
+        if m["role"] != cleaned[-1]["role"]:
+            cleaned.append(m)
+    while cleaned and cleaned[-1]["role"] != "user":
+        cleaned.pop()
+    return cleaned
+ 
+def _extract_text_from_response(resp) -> str:
+    output = resp.output
+    text = getattr(output, 'text', None)
+    if text and isinstance(text, str) and text.strip():
+        return text
+    choices = getattr(output, 'choices', None)
+    if choices and isinstance(choices, list) and len(choices) > 0:
+        msg = getattr(choices[0], 'message', None)
+        if msg:
+            content = getattr(msg, 'content', None)
+            if content and isinstance(content, str) and content.strip():
+                return content
+        assistant = getattr(choices[0], 'assistant', None)
+        if assistant:
+            if isinstance(assistant, dict):
+                content = assistant.get('content') or assistant.get('text')
+                if content and isinstance(content, str) and content.strip():
+                    return content
+            elif isinstance(assistant, str) and assistant.strip():
+                return assistant
+    if isinstance(output, str) and output.strip():
+        return output
+    if isinstance(output, dict):
+        text = output.get('text')
+        if not (text and isinstance(text, str) and text.strip()):
+            text = output.get('content')
+        if text and isinstance(text, str) and text.strip():
+            return text
+    assistant = getattr(output, 'assistant', None)
+    if assistant:
+        if isinstance(assistant, dict):
+            text = assistant.get('content') or assistant.get('text')
+            if text and isinstance(text, str) and text.strip():
+                return text
+        elif isinstance(assistant, str) and assistant.strip():
+            return assistant
+    return ""
+ 
+def call_bailian(messages: List[Dict]) -> str:
+    if not is_model_healthy():
+        raise RuntimeError("服务暂时不可用")
+    dashscope.api_key = DASHSCOPE_API_KEY
+    cleaned = _clean_for_api(messages)
+    if not cleaned:
+        raise RuntimeError("上下文中没有有效的用户消息")
+    full_msgs = cleaned
+    BAILIAN_APP_ID = "45db2f797bfd49229f757b04ed13ac92"
+    retries, delay = 3, 2
+    for attempt in range(retries):
+        try:
+            resp = Application.call(
+                app_id=BAILIAN_APP_ID,
+                messages=full_msgs,
+                stream=False
+            )
+            if resp.status_code == HTTPStatus.OK:
+                full_text = _extract_text_from_response(resp)
+                if not full_text or not full_text.strip():
+                    raise RuntimeError("模型返回内容为空")
+                reset_health_status()
+                return full_text
+            else:
+                raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
+        except Exception as e:
+            err_type = _classify_error(e)
+            if attempt == retries - 1:
+                mark_failure(err_type)
+                raise RuntimeError(f"模型连续{retries}次调用失败: {e}")
+            logger.warning(f"call_bailian 重试 {attempt+1}/{retries} [{err_type}]: {e}")
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("未知错误")
+ 
+def call_bailian_with_token_check(messages: List[Dict]) -> str:
+    MAX_INPUT_TOKENS = 16000
+    SYSTEM_PROMPT_RESERVE = 2500
+    total_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in messages)
+    if total_tokens > MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE:
+        logger.warning(f"输入超长 ({total_tokens} tokens)，自动截断最近消息")
+        trimmed = []
+        running_tokens = 0
+        limit = MAX_INPUT_TOKENS - SYSTEM_PROMPT_RESERVE
+        for m in reversed(messages):
+            t = estimate_tokens(str(m.get("content", "")))
+            if running_tokens + t > limit:
+                break
+            trimmed.insert(0, m)
+            running_tokens += t
+        messages = trimmed
+        logger.info(f"截断后 {len(messages)} 条消息，~{running_tokens} tokens")
+    return call_bailian(messages)
+ 
+# ================= 工具 =================
+def export_docx(messages):
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = '仿宋'
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+    title = doc.add_heading('', level=1)
+    title_run = title.add_run("智飞投研对话记录")
+    title_run.font.name = '仿宋'
+    title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+    title_run.font.size = Pt(16)
+    title_run.font.bold = True
+    for m in messages:
+        role = "用户" if m.get("role") == "user" else "助手"
+        content = m.get("content") or ""
+        ts = m.get("timestamp", "")[:16]
+        prefix = f"[{ts}] " if ts else ""
+        para = doc.add_paragraph()
+        run = para.add_run(f"{prefix}{role}：{content}")
+        run.font.name = '仿宋'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+        run.font.size = Pt(14)
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+ 
+# ================= 启动初始化 =================
+def init_session_on_startup():
+    """启动初始化：分离 display_messages(渲染) 和 messages(模型上下文)"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "display_messages" not in st.session_state:
+        st.session_state.display_messages = []
+    if "history_loaded" not in st.session_state:
+        st.session_state.history_loaded = False
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = ""
+    if "render_offset" not in st.session_state:
+        st.session_state.render_offset = 0
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = MODEL_NAME
+    if "scheme" not in st.session_state:
+        st.session_state.scheme = "日常对话"
 
+    if not st.session_state.session_id:
+        st.session_state.session_id = str(uuid.uuid4())
 
+    if not st.session_state.history_loaded:
+        # 模型上下文：只放恢复指令，不加载历史消息
+        if not st.session_state.messages:
+            st.session_state.messages.append({
+                "role": "user",
+                "content": (
+                    "[系统] 请恢复上文：\n"
+                    "1. 调用 searchOSSFileByFileName 搜索 chat_memory/chat_summary/history_summary（不传 mediaType）\n"
+                    "2. 将三个 URL 写入 /tmp/oss_urls.json\n"
+                    "3. 执行 python3 /root/workspace/context_manager.py restore\n"
+                    "4. 根据恢复结果，用以下格式回复：\n"
+                    "   - 恢复成功：✅ 上文恢复成功 | 摘要：xxx | 最近N轮对话 | 历史摘要N条\n"
+                    "   - OSS无数据：⚠️ 上文恢复失败：OSS暂无对话数据，本次为全新会话\n"
+                    "   - 脚本不存在：⚠️ 上文恢复失败：沙箱工具未部署\n"
+                    "   - 执行报错：⚠️ 上文恢复失败：具体错误信息"
+                ),
+                "timestamp": now_ts_display()
+            })
+            st.session_state.generating = True
+
+        st.session_state.history_loaded = True
+
+    return {"success": True}
+
+ 
 # ================= UI =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
-st.title("📱 智飞投研")
-
-restore_result = init_session_on_startup()
-
+st.title("智飞投研")
+ 
 if "generating" not in st.session_state:
     st.session_state.generating = False
 if "stop" not in st.session_state:
     st.session_state.stop = False
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
+if "display_messages" not in st.session_state:
+    st.session_state.display_messages = []
+ 
+restore_result = init_session_on_startup()
+ 
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
-
+ 
 chat_container = st.container()
 with chat_container:
     MAX_RENDER_MSGS = 60
-    total_msgs = len(st.session_state.messages)
+    total_msgs = len(st.session_state.display_messages)
     render_count = (st.session_state.get("render_offset", 0) + 1) * MAX_RENDER_MSGS
     render_start = max(0, total_msgs - render_count)
-    render_msgs = st.session_state.messages[render_start:] if st.session_state.messages else []
-
+    render_msgs = st.session_state.display_messages[render_start:] if st.session_state.display_messages else []
+ 
     if render_start > 0:
-        if st.button("⬆️ 加载更早的对话", use_container_width=True):
+        if st.button("加载更早的对话", use_container_width=True):
             st.session_state.render_offset = st.session_state.get("render_offset", 0) + 1
             st.rerun()
-
+ 
     for m in render_msgs:
         with st.chat_message(m.get("role", "user")):
             content = str(m.get("content") or "")
@@ -895,164 +476,184 @@ with chat_container:
                 st.error(content)
             else:
                 st.markdown(content)
-
+ 
+# 捕获侧边栏触发的快捷输入
+_pending_prompt = st.session_state.pop("_pending_prompt", None)
 user_input = st.chat_input("输入消息...", disabled=st.session_state.generating)
-
+if _pending_prompt and not st.session_state.generating:
+    user_input = _pending_prompt
+ 
 if user_input and not st.session_state.generating:
     st.session_state.stop = False
     st.session_state.generating = True
-
     round_num = len([m for m in st.session_state.messages if m["role"] == "user"]) + 1
-
     user_msg = {
         "role": "user",
         "content": user_input,
-        "timestamp": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        "timestamp": now_ts_display()
     }
     st.session_state.messages.append(user_msg)
+    st.session_state.display_messages.append(user_msg)
     st.rerun()
-
+ 
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     round_num = len([m for m in st.session_state.messages if m["role"] == "user"])
     user_msg = st.session_state.messages[-1]
-
     ctx = [{"role": m["role"], "content": str(m.get("content") or "")} for m in st.session_state.messages]
-
     try:
-        with st.spinner("💭 思考中..."):
+        with st.spinner("思考中..."):
             reply = call_bailian_with_token_check(ctx)
-
         assistant_msg = {
             "role": "assistant",
             "content": reply,
-            "timestamp": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": now_ts_display()
         }
         st.session_state.messages.append(assistant_msg)
-
+        st.session_state.display_messages.append(assistant_msg)
         messages_list = [user_msg, assistant_msg]
         messages_dict = {"messages": messages_list}
-        sync_to_oss([{
-            "session_id": st.session_state.session_id,
-            "round_num": round_num,
-            "messages": messages_dict,
-            "ts": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        }])
-
+        ts_str = now_ts_display()
+        core_engine.save_round(
+            session_id=st.session_state.session_id,
+            round_num=round_num,
+            messages=messages_dict,
+            ts=ts_str
+        )
     except Exception as e:
-        st.error(f"❌ 错误: {e}")
-        st.session_state.messages.append({
+        st.error(f"错误: {e}")
+        err_msg = {
             "role": "assistant",
-            "content": f"❌ 调用失败: {e}",
-            "timestamp": datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        })
-
+            "content": f"调用失败: {e}",
+            "timestamp": now_ts_display()
+        }
+        st.session_state.messages.append(err_msg)
+        st.session_state.display_messages.append(err_msg)
     st.session_state.generating = False
     st.rerun()
-
+ 
 st.divider()
+ 
 col1, col2, col3 = st.columns(3)
 with col1:
-    if st.button("➕ 新建会话", use_container_width=True, disabled=st.session_state.generating):
+    if st.button("新建会话", use_container_width=True, disabled=st.session_state.generating):
         old_sid = st.session_state.session_id
         if old_sid and st.session_state.messages:
-            st.session_state.is_restoring = True
-            _backup_executor.submit(trigger_backup_and_restore, old_sid)
+            try:
+                core_engine.archive_session(old_sid)
+            except Exception as e:
+                logger.warning(f"归档旧会话失败: {e}")
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.history_loaded = False
         st.session_state.generating = False
         st.session_state.stop = False
         st.session_state.render_offset = 0
+        st.session_state.messages = []
+        # display_messages 不清空，历史对话保留在聊天框
         st.rerun()
 with col2:
-    if st.button("🔄 重新生成", use_container_width=True, disabled=st.session_state.generating):
+    if st.button("重新生成", use_container_width=True, disabled=st.session_state.generating):
         if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
             st.session_state.messages.pop()
+            st.session_state.display_messages.pop()
             st.session_state.generating = True
             st.session_state.stop = False
             st.rerun()
 with col3:
     st.download_button(
-        label="📤 导出DOCX",
-        data=export_docx(st.session_state.messages),
+        label="导出DOCX",
+        data=export_docx(st.session_state.display_messages),
         file_name=f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         use_container_width=True,
         key="export_docx_btn"
     )
-
+ 
 # ================= 侧边栏 =================
 with st.sidebar:
-    st.subheader("📋 系统状态")
-
-    # ---- 启动恢复状态（模型上文） ----
-    has_summary = bool(st.session_state.get("cached_summary", ""))
-
-    if restore_result.get("error"):
-        st.error(f"❌ 上文恢复失败: {restore_result['error']}")
-    elif restore_result.get("rounds", 0) > 0 and has_summary:
-        st.success("✅ 上文恢复成功")
-        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话")
-        st.caption(f"📦 来源: {restore_result['source']}")
-        st.caption("📄 累积摘要: chat_summary.jsonl")
-    elif restore_result.get("rounds", 0) > 0:
-        st.success("✅ 上文恢复成功")
-        st.caption(f"💬 最近 {restore_result['rounds']} 轮对话")
-        st.caption(f"📦 来源: {restore_result['source']}")
-    elif has_summary:
-        st.success("✅ 上文恢复成功")
-        st.caption("📄 累积摘要已加载")
-        st.caption("📦 来源: chat_summary.jsonl")
-    else:
-        st.caption("⏳ 暂无上文数据")
-
-    # ---- 后加载状态 ----
-    with _recovery_lock:
-        backup_status = _recovery_store.get("backup_status", {})
-    if backup_status:
-        st.divider()
-        st.caption("🔄 后加载状态")
-        if backup_status.get("running"):
-            st.info("⏳ 正在恢复旧会话上文...")
-        elif backup_status.get("error"):
-            st.error(f"❌ 后加载失败: {backup_status['error']}")
-        elif backup_status.get("summary_restored") or backup_status.get("rounds_restored", 0) > 0:
-            st.success("✅ 旧会话上文已恢复")
-            if backup_status.get("summary_restored"):
-                st.caption("📄 摘要已生成")
-            if backup_status.get("rounds_restored", 0) > 0:
-                st.caption(f"💬 最近 {backup_status['rounds_restored']} 轮对话")
-            if backup_status.get("source"):
-                st.caption(f"📦 来源: {backup_status['source']}")
-        else:
-            st.caption("⏳ 暂无后加载数据")
-
-    # ---- OSS 写入状态 ----
+    st.title("🚀 智飞投研")
+    st.caption(f"当前时间: {now_ts_display()}")
+    st.info(f"当前模型: **{st.session_state.model_name}**")
     st.divider()
-    st.caption("💾 OSS 同步状态")
-    oss_status = st.session_state.get("oss_write_status", {})
-    if oss_status.get("running"):
-        st.info("⏳ 正在写入 OSS...")
-    elif oss_status.get("success"):
-        st.success(f"✅ OSS 写入成功: {oss_status.get('lines', 0)} 行")
-    elif oss_status.get("error"):
-        st.error(f"❌ OSS 写入失败: {oss_status['error']}")
-    else:
-        st.caption("⏳ 尚未写入 OSS")
-
-    # ---- 历史对话列表 ----
+ 
+    # === 分析方案 ===
+    st.subheader("📊 分析方案")
+    scheme_cols_1 = st.columns(3)
+    scheme_cols_2 = st.columns(3)
+    schemes = ["A盘前快速分析", "B产业链扫描", "C卡脖子扫描", "D市场行情判断", "E资金全景动态", "F个股深度分析"]
+    for i, scheme_name in enumerate(schemes):
+        col = scheme_cols_1[i] if i < 3 else scheme_cols_2[i - 3]
+        with col:
+            if st.button(scheme_name, key=f"scheme_{i}", use_container_width=True):
+                st.session_state.scheme = scheme_name
+                if is_one_click_scheme(scheme_name):
+                    st.session_state._pending_prompt = get_scheme_prompt(scheme_name)
+                    st.rerun()
+                else:
+                    st.toast(f"已切换至: {scheme_name}，请输入标的/事件", icon="ℹ️")
     st.divider()
-    st.subheader("📜 历史对话")
+ 
+    # === 快捷工具 ===
+    st.subheader("⚡ 快捷工具")
+    tool_cols = st.columns(3)
+    with tool_cols[0]:
+        if st.button("📋 每日简报", use_container_width=True, key="daily_brief"):
+            st.session_state.scheme = "每日简报"
+            st.session_state._pending_prompt = "今日简报"
+            st.rerun()
+    with tool_cols[1]:
+        if st.button("📊 投研周报", use_container_width=True, key="weekly_report"):
+            st.session_state.scheme = "投研周报"
+            st.session_state._pending_prompt = "本周周报"
+            st.rerun()
+    with tool_cols[2]:
+        if st.button("🔍 个股速看", use_container_width=True, key="quick_stock"):
+            st.session_state.scheme = "个股速看"
+            st.toast("请输入股票代码或名称，如：300308", icon="ℹ️")
+    st.success(f"当前方案: **{st.session_state.scheme}**")
+    st.divider()
+ 
+    # === Token 监测 ===
+    st.subheader("📊 Token 容量监控")
+    total_used = st.session_state.get("total_tokens_used", 0)
+    BUDGET = 1000000
+    usage_ratio = min(total_used / BUDGET, 1.0)
+    if usage_ratio >= 0.8:
+        st.warning(f"⚠️ Token使用量已达 {usage_ratio*100:.1f}%")
+    elif usage_ratio >= 0.6:
+        st.info(f"ℹ️ Token使用量: {usage_ratio*100:.1f}%")
+    st.progress(usage_ratio, text=f"{total_used:,} / {BUDGET:,} ({usage_ratio*100:.1f}%)")
+    st.caption(f"💰 本会话累计消耗: `{total_used:,}` Tokens")
+    st.divider()
+ 
+    # === 系统状态 ===
+    st.subheader("系统状态")
+    st.caption("系统就绪")
+ 
+    st.divider()
+ 
+    if st.button("OSS同步到本地SQLite", use_container_width=True):
+        try:
+            core_engine.startup_align()
+            st.success("同步完成")
+        except Exception as e:
+            st.error(f"同步失败: {e}")
+ 
+    st.divider()
+    st.caption("存储状态")
+    st.caption("已通过 core_engine 自动写入 SQLite 和 OSS")
+ 
+    st.divider()
+    st.subheader("历史对话")
     history_sessions = get_history_sessions()
     if history_sessions:
         for s in history_sessions:
             title = s["title"] if s["title"] else "（无标题）"
-            st.caption(f"• {title} ({s['rounds']}轮)")
+            st.caption(f" {title} ({s['rounds']}轮)")
     else:
         st.caption("暂无历史对话")
-
-    # ---- 清空历史对话 ----
+ 
     st.divider()
-    if st.button("🗑️ 清空历史对话", use_container_width=True):
-        st.session_state.messages = []
+    if st.button("清空显示", use_container_width=True):
+        st.session_state.display_messages = []
         st.session_state.render_offset = 0
         st.rerun()
