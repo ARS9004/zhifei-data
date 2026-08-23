@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-智飞投研 · 云端单文件版 v3.5 (2026-08-23)
+智飞投研 · 云端单文件版 v3.6 (2026-08-23)
 - 上下文恢复：前端发指令，模型通过 executeQuerySql 从 RDS chat_memory/chat_summary 自行恢复
 - 对话写入：模型通过 executeQuerySql 自行写入 RDS chat_memory/chat_summary
 - 前端不再读写 OSS，仅负责发指令 + 展示回复
 - 历史会话列表：从 RDS chat_memory 读取，支持切换和删除
 - 会话渲染内容永久保留，切换会话即可查看
+- 首次加载自动触发上下文恢复，显示模型思考过程
 """
 
 import os
@@ -146,16 +147,10 @@ def _extract_text_from_response(resp) -> str:
             return text
     return ""
 
-def build_context_with_rds_instruction(user_content: str, session_id: str) -> List[Dict]:
-    """
-    构造上下文：系统指令让模型从RDS恢复上文 + 用户消息。
-    session_id 从 st.session_state.session_id 动态传入。
-    chat_memory 表结构：id, session_id, role(enum:user/assistant/system), content, round_num, created_at
-    chat_summary 表结构：id, session_id, summary_type(enum:session/daily/weekly), summary, round_count, created_at
-    """
-    ctx_restore_instruction = f"""[系统] 请恢复上文
+def build_ctx_restore_instruction(session_id: str) -> str:
+    """构造上下文恢复指令，与提示词 #===CTX_RESTORE=== 内容一致"""
+    return f"""[系统] 请恢复上文
 
-使用 executeQuerySql 工具从RDS恢复上下文：
 Step 1 — 查最近对话:
   executeQuerySql(querySql="SELECT role, content FROM chat_memory WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 5")
   → 得到最后5条JSON数据，模型自行解析恢复上下文
@@ -170,10 +165,13 @@ Step 3 — 确认:
 
 Step 4 — 回复用户消息"""
 
+def build_context_for_chat(user_content: str, session_id: str) -> List[Dict]:
+    """构造完整上下文：恢复指令 + 用户消息"""
     return [
-        {"role": "system", "content": ctx_restore_instruction},
+        {"role": "system", "content": build_ctx_restore_instruction(session_id)},
         {"role": "user", "content": user_content}
     ]
+
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
@@ -253,7 +251,6 @@ def get_history_sessions():
             connect_timeout=5
         )
         cursor = conn.cursor()
-        # 排除已删除的会话
         cursor.execute("""
             SELECT cm.session_id, COUNT(*) as rounds, MAX(cm.created_at) as last_time,
                    (SELECT cm2.content FROM chat_memory cm2 
@@ -360,14 +357,57 @@ def init_session():
         st.session_state.stop = False
     if "total_tokens_used" not in st.session_state:
         st.session_state.total_tokens_used = 0
-    if "session_loaded" not in st.session_state:
-        st.session_state.session_loaded = False
+    if "history_loaded" not in st.session_state:
+        st.session_state.history_loaded = False
+    if "ctx_restoring" not in st.session_state:
+        st.session_state.ctx_restoring = False
+
+# ================= 上下文恢复(首次加载) =================
+def trigger_ctx_restore():
+    """首次加载时触发上下文恢复，让模型去RDS查历史对话"""
+    if st.session_state.history_loaded:
+        return
+    if st.session_state.messages:
+        st.session_state.history_loaded = True
+        return
+
+    st.session_state.ctx_restoring = True
+    st.session_state.generating = True
+
+    ctx = [
+        {"role": "system", "content": build_ctx_restore_instruction(st.session_state.session_id)},
+        {"role": "user", "content": "你好"}
+    ]
+
+    try:
+        with st.spinner("正在恢复上下文..."):
+            reply = call_bailian(ctx)
+
+        restore_msg = {
+            "role": "assistant",
+            "content": reply,
+            "timestamp": now_ts_display()
+        }
+        st.session_state.messages.append(restore_msg)
+        st.session_state.display_messages.append(restore_msg)
+
+    except Exception as e:
+        logger.warning(f"上下文恢复失败: {e}")
+
+    st.session_state.history_loaded = True
+    st.session_state.ctx_restoring = False
+    st.session_state.generating = False
 
 # ================= UI =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
 st.title("智飞投研")
 
 init_session()
+
+# 首次加载触发上下文恢复
+if not st.session_state.history_loaded:
+    trigger_ctx_restore()
+    st.rerun()
 
 total_rounds = len([m for m in st.session_state.messages if m["role"] == "user"])
 st.caption(f"{total_rounds} 轮对话")
@@ -412,33 +452,35 @@ if user_input and not st.session_state.generating:
 
 # ================= 生成回复 =================
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    user_msg = st.session_state.messages[-1]
-    ctx = build_context_with_rds_instruction(
-        str(user_msg.get("content") or ""),
-        st.session_state.session_id
-    )
+    # 跳过上下文恢复阶段的生成
+    if not st.session_state.ctx_restoring:
+        user_msg = st.session_state.messages[-1]
+        ctx = build_context_for_chat(
+            str(user_msg.get("content") or ""),
+            st.session_state.session_id
+        )
 
-    try:
-        with st.spinner("思考中..."):
-            reply = call_bailian(ctx)
+        try:
+            with st.spinner("思考中..."):
+                reply = call_bailian(ctx)
 
-        assistant_msg = {
-            "role": "assistant",
-            "content": reply,
-            "timestamp": now_ts_display()
-        }
-        st.session_state.messages.append(assistant_msg)
-        st.session_state.display_messages.append(assistant_msg)
+            assistant_msg = {
+                "role": "assistant",
+                "content": reply,
+                "timestamp": now_ts_display()
+            }
+            st.session_state.messages.append(assistant_msg)
+            st.session_state.display_messages.append(assistant_msg)
 
-    except Exception as e:
-        st.error(f"错误: {e}")
-        err_msg = {
-            "role": "assistant",
-            "content": f"调用失败: {e}",
-            "timestamp": now_ts_display()
-        }
-        st.session_state.messages.append(err_msg)
-        st.session_state.display_messages.append(err_msg)
+        except Exception as e:
+            st.error(f"错误: {e}")
+            err_msg = {
+                "role": "assistant",
+                "content": f"调用失败: {e}",
+                "timestamp": now_ts_display()
+            }
+            st.session_state.messages.append(err_msg)
+            st.session_state.display_messages.append(err_msg)
 
     st.session_state.generating = False
     st.rerun()
@@ -452,6 +494,7 @@ with col1:
         st.session_state.messages = []
         st.session_state.display_messages = []
         st.session_state.render_offset = 0
+        st.session_state.history_loaded = False
         st.rerun()
 
 with col2:
@@ -552,6 +595,7 @@ with st.sidebar:
                         st.session_state.messages = msgs
                         st.session_state.display_messages = msgs.copy()
                         st.session_state.render_offset = 0
+                        st.session_state.history_loaded = True
                         st.rerun()
             with col_b:
                 if st.button("🗑", key=f"del_{sid}", help="删除此会话"):
@@ -561,6 +605,7 @@ with st.sidebar:
                             st.session_state.messages = []
                             st.session_state.display_messages = []
                             st.session_state.render_offset = 0
+                            st.session_state.history_loaded = False
                         st.rerun()
     else:
         st.caption("暂无历史会话")
