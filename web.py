@@ -152,11 +152,11 @@ def build_ctx_restore_instruction(session_id: str) -> str:
     return f"""[系统] 请恢复上文
 
 Step 1 — 查最近对话:
-  executeQuerySql(querySql="SELECT role, content FROM chat_memory WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 5")
+    executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
   → 得到最后5条JSON数据，模型自行解析恢复上下文
 
 Step 2 — 查最新摘要:
-  executeQuerySql(querySql="SELECT summary FROM chat_summary WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 1")
+  executeQuerySql(querySql="SELECT summary FROM chat_summary ORDER BY id DESC LIMIT 1")
   → 得到最新1条摘要，辅助理解对话脉络
 
 Step 3 — 确认:
