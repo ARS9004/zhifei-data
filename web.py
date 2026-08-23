@@ -156,22 +156,24 @@ def build_context_with_rds_instruction(user_content: str, session_id: str) -> Li
     ctx_restore_instruction = f"""[系统] 请恢复上文
 
 使用 executeQuerySql 工具从RDS恢复上下文：
-1. 查询 chat_memory 表最后5条记录：
-   SELECT role, content, round_num FROM chat_memory WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 5
-2. 查询 chat_summary 表最新1条摘要：
-   SELECT summary, round_count FROM chat_summary WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 1
-3. 根据查询结果自行恢复上下文，然后回复用户消息
+Step 1 — 查最近对话:
+  executeQuerySql(querySql="SELECT role, content FROM chat_memory WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 5")
+  → 得到最后5条JSON数据，模型自行解析恢复上下文
 
-对话结束后，使用 executeQuerySql 将本轮对话写入RDS：
-- INSERT INTO chat_memory(session_id,role,content,round_num) VALUES('{session_id}','user','用户消息',N)
-- INSERT INTO chat_memory(session_id,role,content,round_num) VALUES('{session_id}','assistant','助手回复摘要',N)
-- INSERT INTO chat_summary(session_id,summary_type,summary,round_count) VALUES('{session_id}','session','本轮摘要',N)"""
+Step 2 — 查最新摘要:
+  executeQuerySql(querySql="SELECT summary FROM chat_summary WHERE session_id='{session_id}' ORDER BY id DESC LIMIT 1")
+  → 得到最新1条摘要，辅助理解对话脉络
+
+Step 3 — 确认:
+  有数据: ✅ 上文已恢复 | 最近N轮对话 | 摘要概要
+  无数据: ⚠️ RDS暂无对话数据，本次为全新会话
+
+Step 4 — 回复用户消息"""
 
     return [
         {"role": "system", "content": ctx_restore_instruction},
         {"role": "user", "content": user_content}
     ]
-
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
