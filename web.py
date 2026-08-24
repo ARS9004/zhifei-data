@@ -179,6 +179,7 @@ Step 4 — 回复用户消息
   1. searchOSSFileByFileName×3→/tmp/oss_urls.json
   2. bash: python3 /root/workspace/context_manager.py restore
   3. 模型解析输出恢复上下文
+""" 
 
 def build_context_for_chat(user_content: str, session_id: str) -> List[Dict]:
     """构造完整上下文: 恢复指令 + 用户消息"""
