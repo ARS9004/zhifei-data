@@ -52,7 +52,7 @@ DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY:
     raise RuntimeError("请配置 DASHSCOPE_API_KEY")
 
-MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "qwen-plus")
+MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "deep seek-v4-pro")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -62,7 +62,7 @@ def now_ts_display():
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_one_click_scheme(scheme_name):
-    return scheme_name in ["A盘前快速分析", "B产业链扫描", "每日简报", "投研周报"]
+    return scheme_name in ["盘前快速分析", "产业链扫描", "简报", "周报"]
 
 def get_scheme_prompt(scheme_name):
     return f"请执行【{scheme_name}】分析方案"
@@ -151,20 +151,34 @@ def build_ctx_restore_instruction(session_id: str) -> str:
     """构造上下文恢复指令，与提示词 #===CTX_RESTORE=== 内容一致"""
     return f"""[系统] 请恢复上文
 
+触发: 收到 "[系统] 请恢复上文" 时执行，使用rds连接器的工具从rds恢复，不得使用沙箱参
+
 Step 1 — 查最近对话:
-    executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
+  executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
   → 得到最后5条JSON数据，模型自行解析恢复上下文
 
 Step 2 — 查最新摘要:
   executeQuerySql(querySql="SELECT summary FROM chat_summary ORDER BY id DESC LIMIT 1")
   → 得到最新1条摘要，辅助理解对话脉络
 
-Step 3 — 确认:
-  有数据: ✅ 上文恢复成功 | 摘要: [chat_summary最新摘要内容]| 最近N轮对话 | 历史摘要N条
-  无数据: ⚠️ RDS暂无对话数据，本次为全新会话
-  报错：⚠️ 恢复失败：具体错误信息
+Step 3 — 回执-确认并展示:
+  有数据时回复格式:
+    ✅ 上文恢复成功 | 摘要: [chat_summary最新摘要内容]| 最近N轮对话 | 历史摘要N条  
+    💬 最近对话:
+      - 飞哥: "[用户最后一条消息摘要]"
+      - 我: "[助手最后一条回复摘要]"
+    无数据时回复格式:
+    ⚠️ RDS暂无对话数据，本次为全新会话
+    ⚠️ 恢复失败：具体错误信息
+      
+    然后继续回复用户消息
 
-Step 4 — 回复用户消息"""
+Step 4 — 回复用户消息
+
+备选(RDS不可用):
+  1. searchOSSFileByFileName×3→/tmp/oss_urls.json
+  2. bash: python3 /root/workspace/context_manager.py restore
+  3. 模型解析输出恢复上下文
 
 def build_context_for_chat(user_content: str, session_id: str) -> List[Dict]:
     """构造完整上下文：恢复指令 + 用户消息"""
@@ -215,14 +229,14 @@ def export_docx(messages):
     style.element.get_or_add_rPr().get_or_add_rFonts().set(qn('w:eastAsia'), '仿宋')
 
     title = doc.add_heading('', level=1)
-    title_run = title.add_run("智飞投研对话记录")
+    title_run = title.add_run("智飞投研分析方案")
     title_run.font.name = '仿宋'
     title_run._element.get_or_add_rPr().get_or_add_rFonts().set(qn('w:eastAsia'), '仿宋')
     title_run.font.size = Pt(16)
     title_run.font.bold = True
 
     for m in messages:
-        role = "用户" if m.get("role") == "user" else "助手"
+        role = "用户" if m.get("role") == "user" else "智飞"
         content = m.get("content") or ""
         ts = m.get("timestamp", "")[:16]
         prefix = f"[{ts}] " if ts else ""
@@ -365,7 +379,6 @@ def init_session():
 
 # ================= 上下文恢复(首次加载) =================
 def trigger_ctx_restore():
-    """首次加载时触发上下文恢复，让模型去RDS查历史对话"""
     if st.session_state.history_loaded:
         return
     if st.session_state.messages:
@@ -375,9 +388,27 @@ def trigger_ctx_restore():
     st.session_state.ctx_restoring = True
     st.session_state.generating = True
 
+    # 用户消息直接包含恢复指令 + 输出格式（和本地端一致）
+    user_content = """[系统] 请恢复上文：
+
+使用 executeQuerySql 工具从RDS恢复上下文：
+1. executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
+  → 得到最后5条JSON数据，模型自行解析恢复上下文
+2. executeQuerySql(querySql="SELECT summary FROM chat_summary ORDER BY id DESC LIMIT 1")
+  → 得到最新1条摘要，辅助理解对话脉络
+3. 根据查询结果，用以下格式回复：
+   - 有数据时回复格式:
+    ✅ 上文恢复成功 | 摘要: [chat_summary最新摘要内容]| 最近N轮对话 | 历史摘要N条  
+    💬 最近对话:
+      - 飞哥: "[用户最后一条消息摘要]"
+      - 我: "[助手最后一条回复摘要]"
+    -无数据时回复格式:
+    -⚠️ RDS暂无对话数据，本次为全新会话
+    -⚠️ 恢复失败：具体错误信息"""
+
     ctx = [
-        {"role": "system", "content": build_ctx_restore_instruction(st.session_state.session_id)},
-        {"role": "user", "content": "你好"}
+        {"role": "system", "content": "你是智飞投研助手。"},
+        {"role": "user", "content": user_content}
     ]
 
     try:
@@ -526,7 +557,7 @@ with st.sidebar:
     st.subheader("分析方案")
     scheme_cols_1 = st.columns(3)
     scheme_cols_2 = st.columns(3)
-    schemes = ["A盘前快速分析", "B产业链扫描", "C卡脖子扫描", "D市场行情判断", "E资金全景动态", "F个股深度分析"]
+    schemes = ["盘前快速分析", "产业链扫描", "卡脖子扫描", "市场行情判断", "资金全景动态", "标的股研报"]
     for i, scheme_name in enumerate(schemes):
         col = scheme_cols_1[i] if i < 3 else scheme_cols_2[i - 3]
         with col:
@@ -542,18 +573,18 @@ with st.sidebar:
     st.subheader("快捷工具")
     tool_cols = st.columns(3)
     with tool_cols[0]:
-        if st.button("每日简报", use_container_width=True, key="daily_brief"):
-            st.session_state.scheme = "每日简报"
+        if st.button("简报", use_container_width=True, key="daily_brief"):
+            st.session_state.scheme = "简报"
             st.session_state._pending_prompt = "今日简报"
             st.rerun()
     with tool_cols[1]:
-        if st.button("投研周报", use_container_width=True, key="weekly_report"):
-            st.session_state.scheme = "投研周报"
+        if st.button("周报", use_container_width=True, key="weekly_report"):
+            st.session_state.scheme = "周报"
             st.session_state._pending_prompt = "本周周报"
             st.rerun()
     with tool_cols[2]:
-        if st.button("个股速看", use_container_width=True, key="quick_stock"):
-            st.session_state.scheme = "个股速看"
+        if st.button("速查", use_container_width=True, key="quick_stock"):
+            st.session_state.scheme = "速查"
             st.toast("请输入股票代码或名称，如：300308", icon="ℹ️")
     st.success(f"当前方案: **{st.session_state.scheme}**")
     st.divider()
@@ -616,3 +647,47 @@ with st.sidebar:
         st.session_state.display_messages = []
         st.session_state.render_offset = 0
         st.rerun()
+
+# ================= RDS同步到OSS =================
+def sync_rds_to_oss():
+    """从RDS导出全部对话数据到OSS"""
+    import pymysql
+    conn = pymysql.connect(
+        host=get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"),
+        port=int(get_secret_or_env("RDS_PORT", "rds.port", "3306")),
+        user=get_secret_or_env("RDS_USER", "rds.user", "zhuanz1"),
+        password=get_secret_or_env("RDS_PASSWORD", "rds.password", ""),
+        database="stock_db",
+        charset="utf8mb4",
+        connect_timeout=5
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT session_id, round_num, messages, ts FROM chat_memory ORDER BY id ASC")
+    rows = cursor.fetchall()
+    conn.close()
+
+    lines = []
+    for row in rows:
+        lines.append(json.dumps({
+            "session_id": row[0],
+            "round_num": row[1],
+            "messages": json.loads(row[2]),
+            "ts": str(row[3])
+        }, ensure_ascii=False))
+
+    content = "\n".join(lines) + "\n"
+    bucket = get_oss_client()
+    bucket.put_object(OSS_PREFIX + "chat_history/chat_memory_backup.jsonl", content.encode('utf-8'))
+    return len(lines)
+
+st.divider()
+if st.button("☁️ RDS同步到OSS备份", use_container_width=True):
+    with st.spinner("正在同步..."):
+        count = sync_rds_to_oss()
+        st.toast(f"✅ 已同步 {count} 条到 OSS", icon="☁️")
+        st.rerun()
+
+
+
+
+
