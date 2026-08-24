@@ -181,7 +181,7 @@ Step 4 — 回复用户消息
   3. 模型解析输出恢复上下文
 
 def build_context_for_chat(user_content: str, session_id: str) -> List[Dict]:
-    """构造完整上下文：恢复指令 + 用户消息"""
+    """构造完整上下文: 恢复指令 + 用户消息"""
     return [
         {"role": "system", "content": build_ctx_restore_instruction(session_id)},
         {"role": "user", "content": user_content}
