@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-智飞投研 · 云端单文件版 v3.6 (2026-08-23)
-- 上下文恢复：前端发指令，模型通过 executeQuerySql 从 RDS chat_memory/chat_summary 自行恢复
-- 对话写入：模型通过 executeQuerySql 自行写入 RDS chat_memory/chat_summary
-- 前端不再读写 OSS，仅负责发指令 + 展示回复
-- 历史会话列表：从 RDS chat_memory 读取，支持切换和删除
-- 会话渲染内容永久保留，切换会话即可查看
-- 首次加载自动触发上下文恢复，显示模型思考过程
+智飞投研 · 云端 v3.8 (2026-08-25)
+- 后加载-智能接续：新会话启动时，取最后5轮完整对话 + 最后25轮摘要
+- 每轮写入：前端发指令，模型 executeQuerySql 写入 RDS
+- 依赖百炼 session 记忆，启动恢复后正常对话由百炼接管
 """
 
 import os
@@ -52,7 +49,7 @@ DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY:
     raise RuntimeError("请配置 DASHSCOPE_API_KEY")
 
-MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "deep seek-v4-pro")
+MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "deepseek-v4-pro")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -147,46 +144,32 @@ def _extract_text_from_response(resp) -> str:
             return text
     return ""
 
-def build_ctx_restore_instruction(session_id: str) -> str:
-    """构造上下文恢复指令，与提示词 #===CTX_RESTORE=== 内容一致"""
-    return f"""[系统] 请恢复上文
+def build_ctx_restore_instruction() -> str:
+    """后加载-智能接续：新会话启动时执行一次"""
+    return """新会话启动，接上之前的内容：
 
-触发: 收到 "[系统] 请恢复上文" 时执行，使用rds连接器的工具从rds恢复，不得使用沙箱参
+从 chat_memory 最后取两段数据：
+- 最后5轮完整对话（做无缝对接）
+- 最后25轮对话数据（用来写摘要）
 
-Step 1 — 查最近对话:
-  executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
-  → 得到最后5条JSON数据，模型自行解析恢复上下文
+用那25轮写一篇500字左右的摘要，把最近聊了什么主线、涉及的标的和板块、关键结论都串起来。
 
-Step 2 — 查最新摘要:
-  executeQuerySql(querySql="SELECT summary FROM chat_summary ORDER BY id DESC LIMIT 1")
-  → 得到最新1条摘要，辅助理解对话脉络
+回复的时候先贴摘要，再贴最后5轮完整对话，然后正常回我消息。"""
 
-Step 3 — 回执-确认并展示:
-  有数据时回复格式:
-    ✅ 上文恢复成功 | 摘要: [chat_summary最新摘要内容]| 最近N轮对话 | 历史摘要N条  
-    💬 最近对话:
-      - 飞哥: "[用户最后一条消息摘要]"
-      - 我: "[助手最后一条回复摘要]"
-    无数据时回复格式:
-    ⚠️ RDS暂无对话数据，本次为全新会话
-    ⚠️ 恢复失败：具体错误信息
-      
-    然后继续回复用户消息
+def build_write_instruction(user_content: str, assistant_content: str) -> str:
+    """构造对话写入指令（每轮结束后执行）"""
+    user_escaped = json.dumps(user_content, ensure_ascii=False)
+    assistant_escaped = json.dumps(assistant_content, ensure_ascii=False)
+    return f"""[系统] 请将本轮对话原文写入 rds chat_memory：
 
-Step 4 — 回复用户消息
+使用 executeQuerySql 工具操作 rds chat_memory 表，追加新增两条 jsonl 数据：
 
-备选(RDS不可用):
-  1. searchOSSFileByFileName×3→/tmp/oss_urls.json
-  2. bash: python3 /root/workspace/context_manager.py restore
-  3. 模型解析输出恢复上下文
-""" 
+INSERT INTO chat_memory (jsonl) VALUES ('{json.dumps({"role": "user", "content": user_escaped}, ensure_ascii=False)}');
+INSERT INTO chat_memory (jsonl) VALUES ('{json.dumps({"role": "assistant", "content": assistant_escaped}, ensure_ascii=False)}');
 
-def build_context_for_chat(user_content: str, session_id: str) -> List[Dict]:
-    """构造完整上下文: 恢复指令 + 用户消息"""
-    return [
-        {"role": "system", "content": build_ctx_restore_instruction(session_id)},
-        {"role": "user", "content": user_content}
-    ]
+要求：
+- 原文逐字写入，不截断
+- 追加新增，不影响已有数据"""
 
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
@@ -378,7 +361,7 @@ def init_session():
     if "ctx_restoring" not in st.session_state:
         st.session_state.ctx_restoring = False
 
-# ================= 上下文恢复(首次加载) =================
+# ================= 上下文恢复（启动时执行一次）=================
 def trigger_ctx_restore():
     if st.session_state.history_loaded:
         return
@@ -389,27 +372,9 @@ def trigger_ctx_restore():
     st.session_state.ctx_restoring = True
     st.session_state.generating = True
 
-    # 用户消息直接包含恢复指令 + 输出格式（和本地端一致）
-    user_content = """[系统] 请恢复上文：
-
-使用 executeQuerySql 工具从RDS恢复上下文：
-1. executeQuerySql(querySql="SELECT role, content FROM chat_memory ORDER BY id DESC LIMIT 5")
-  → 得到最后5条JSON数据，模型自行解析恢复上下文
-2. executeQuerySql(querySql="SELECT summary FROM chat_summary ORDER BY id DESC LIMIT 1")
-  → 得到最新1条摘要，辅助理解对话脉络
-3. 根据查询结果，用以下格式回复：
-   - 有数据时回复格式:
-    ✅ 上文恢复成功 | 摘要: [chat_summary最新摘要内容]| 最近N轮对话 | 历史摘要N条  
-    💬 最近对话:
-      - 飞哥: "[用户最后一条消息摘要]"
-      - 我: "[助手最后一条回复摘要]"
-    -无数据时回复格式:
-    -⚠️ RDS暂无对话数据，本次为全新会话
-    -⚠️ 恢复失败：具体错误信息"""
-
     ctx = [
         {"role": "system", "content": "你是智飞投研助手。"},
-        {"role": "user", "content": user_content}
+        {"role": "user", "content": build_ctx_restore_instruction()}
     ]
 
     try:
@@ -437,7 +402,6 @@ st.title("智飞投研")
 
 init_session()
 
-# 首次加载触发上下文恢复
 if not st.session_state.history_loaded:
     trigger_ctx_restore()
     st.rerun()
@@ -466,7 +430,6 @@ with chat_container:
             else:
                 st.markdown(content)
 
-# ================= 主输入区 =================
 _pending_prompt = st.session_state.pop("_pending_prompt", None)
 user_input = st.chat_input("输入消息...", disabled=st.session_state.generating)
 if _pending_prompt and not st.session_state.generating:
@@ -483,15 +446,12 @@ if user_input and not st.session_state.generating:
     st.session_state.display_messages.append(user_msg)
     st.rerun()
 
-# ================= 生成回复 =================
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    # 跳过上下文恢复阶段的生成
     if not st.session_state.ctx_restoring:
         user_msg = st.session_state.messages[-1]
-        ctx = build_context_for_chat(
-            str(user_msg.get("content") or ""),
-            st.session_state.session_id
-        )
+        user_content = str(user_msg.get("content") or "")
+
+        ctx = [{"role": "user", "content": user_content}]
 
         try:
             with st.spinner("思考中..."):
@@ -504,6 +464,16 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             }
             st.session_state.messages.append(assistant_msg)
             st.session_state.display_messages.append(assistant_msg)
+
+            write_instruction = build_write_instruction(user_content, reply)
+            write_ctx = [
+                {"role": "system", "content": "你是智飞投研助手，执行 SQL 写入操作。"},
+                {"role": "user", "content": write_instruction}
+            ]
+            try:
+                call_bailian(write_ctx)
+            except Exception as e:
+                logger.warning(f"写入RDS失败: {e}")
 
         except Exception as e:
             st.error(f"错误: {e}")
@@ -548,7 +518,6 @@ with col3:
         key="export_docx_btn"
     )
 
-# ================= 侧边栏 =================
 with st.sidebar:
     st.title("智飞投研")
     st.caption(f"当前时间: {now_ts_display()}")
@@ -606,7 +575,6 @@ with st.sidebar:
     st.caption("模型自行管理上下文 (RDS)")
     st.divider()
 
-    # ===== 历史会话列表 =====
     st.subheader("历史会话")
     history_sessions = get_history_sessions()
     if history_sessions:
@@ -648,47 +616,3 @@ with st.sidebar:
         st.session_state.display_messages = []
         st.session_state.render_offset = 0
         st.rerun()
-
-# ================= RDS同步到OSS =================
-def sync_rds_to_oss():
-    """从RDS导出全部对话数据到OSS"""
-    import pymysql
-    conn = pymysql.connect(
-        host=get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"),
-        port=int(get_secret_or_env("RDS_PORT", "rds.port", "3306")),
-        user=get_secret_or_env("RDS_USER", "rds.user", "zhuanz1"),
-        password=get_secret_or_env("RDS_PASSWORD", "rds.password", ""),
-        database="stock_db",
-        charset="utf8mb4",
-        connect_timeout=5
-    )
-    cursor = conn.cursor()
-    cursor.execute("SELECT session_id, round_num, messages, ts FROM chat_memory ORDER BY id ASC")
-    rows = cursor.fetchall()
-    conn.close()
-
-    lines = []
-    for row in rows:
-        lines.append(json.dumps({
-            "session_id": row[0],
-            "round_num": row[1],
-            "messages": json.loads(row[2]),
-            "ts": str(row[3])
-        }, ensure_ascii=False))
-
-    content = "\n".join(lines) + "\n"
-    bucket = get_oss_client()
-    bucket.put_object(OSS_PREFIX + "chat_history/chat_memory_backup.jsonl", content.encode('utf-8'))
-    return len(lines)
-
-st.divider()
-if st.button("☁️ RDS同步到OSS备份", use_container_width=True):
-    with st.spinner("正在同步..."):
-        count = sync_rds_to_oss()
-        st.toast(f"✅ 已同步 {count} 条到 OSS", icon="☁️")
-        st.rerun()
-
-
-
-
-
