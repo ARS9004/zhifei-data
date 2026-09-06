@@ -60,7 +60,7 @@ def now_ts_display():
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def is_one_click_scheme(scheme_name):
-    return scheme_name in ["盘前快速分析", "产业链扫描", "简报", "周报"]
+    return scheme_name in ["盘前分析", "产业扫描", "简报", "周报"]
 
 def get_scheme_prompt(scheme_name):
     return f"请执行【{scheme_name}】分析方案"
@@ -491,7 +491,7 @@ with st.sidebar:
     st.subheader("📊 分析方案")
     scheme_cols_1 = st.columns(3)
     scheme_cols_2 = st.columns(3)
-    schemes = ["盘前快速分析", "产业链扫描", "卡脖子扫描", "市场行情判断", "资金全景动态", "标的股研报"]
+    schemes = ["盘前分析", "产业扫描", "国产替代", "行情判断", "资金动态", "个股分析"]
     for i, scheme_name in enumerate(schemes):
         col = scheme_cols_1[i] if i < 3 else scheme_cols_2[i - 3]
         with col:
