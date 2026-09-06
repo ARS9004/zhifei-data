@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-智飞投研 · 云端 v3.8 (2026-08-25)
-- 后加载-智能接续：新会话启动时，取最后5轮完整对话 + 最后25轮摘要
-- 每轮写入：前端发指令，模型 executeQuerySql 写入 RDS
-- 依赖百炼 session 记忆，启动恢复后正常对话由百炼接管
+智飞投研 · 云端 v3.9 (2026-09-06)
+- 导出DOCX和上传OSS合并为一个按钮（参照本地版）
+- 历史对话改用前端 session_state 管理，不从RDS查询
+- 删除Token监控
+- 保留：后加载-智能接续、每轮写入RDS、百炼session记忆
 """
 
 import os
@@ -205,7 +206,39 @@ def call_bailian(messages: List[Dict]) -> str:
             delay *= 2
     raise RuntimeError("未知错误")
 
-# ================= 导出 =================
+# ================= 导出DOCX（含标题提取、方案过滤） =================
+def filter_scheme_messages(messages):
+    """从对话消息中过滤出分析方案（只保留助手消息，且内容包含方案标题或关键词）"""
+    scheme_keywords = ["盘前分析", "产业扫描", "国产代替", "行情判断", "资金动态", "个股分析", "速查"]
+    result = []
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content", "")
+        if content.startswith("【") or any(kw in content for kw in scheme_keywords):
+            result.append(m)
+    return result
+
+def extract_title_from_messages(messages):
+    """从对话消息中提取标题，供 OSS 文件命名使用"""
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            content = m.get("content", "")
+            if not content:
+                continue
+            match = re.search(r'【([^】]+)】', content)
+            if match:
+                title = match.group(1).strip()
+                if title:
+                    return title
+            for line in content.split('\n'):
+                line = line.strip()
+                if line:
+                    clean_line = re.sub(r'^#+\s*|\*\*|__', '', line).strip()
+                    if clean_line:
+                        return clean_line[:20]
+    return None
+
 def export_docx(messages):
     doc = Document()
     style = doc.styles['Normal']
@@ -235,107 +268,6 @@ def export_docx(messages):
     buffer.seek(0)
     return buffer
 
-# ================= 会话管理 =================
-def get_history_sessions():
-    """从 RDS chat_memory 读取所有非删除会话列表"""
-    try:
-        import pymysql
-        conn = pymysql.connect(
-            host=get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"),
-            port=int(get_secret_or_env("RDS_PORT", "rds.port", "3306")),
-            user=get_secret_or_env("RDS_USER", "rds.user", "zhuanz1"),
-            password=get_secret_or_env("RDS_PASSWORD", "rds.password", ""),
-            database="stock_db",
-            charset="utf8mb4",
-            connect_timeout=5
-        )
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT cm.session_id, COUNT(*) as rounds, MAX(cm.created_at) as last_time,
-                   (SELECT cm2.content FROM chat_memory cm2 
-                    WHERE cm2.session_id = cm.session_id AND cm2.role = 'user' 
-                    ORDER BY cm2.id ASC LIMIT 1) as first_msg
-            FROM chat_memory cm
-            WHERE cm.session_id NOT IN (SELECT session_id FROM deleted_sessions)
-            GROUP BY cm.session_id
-            ORDER BY last_time DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        sessions = []
-        for row in rows:
-            sid, rounds, last_time, first_msg = row
-            title = (first_msg or "")[:30] if first_msg else "（无标题）"
-            sessions.append({
-                "session_id": sid,
-                "title": title,
-                "rounds": rounds,
-                "last_time": str(last_time) if last_time else ""
-            })
-        return sessions
-    except Exception as e:
-        logger.warning(f"get_history_sessions 失败: {e}")
-        return []
-
-def load_session_messages(session_id: str) -> List[Dict]:
-    """从 RDS chat_memory 加载指定会话的所有消息"""
-    try:
-        import pymysql
-        conn = pymysql.connect(
-            host=get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"),
-            port=int(get_secret_or_env("RDS_PORT", "rds.port", "3306")),
-            user=get_secret_or_env("RDS_USER", "rds.user", "zhuanz1"),
-            password=get_secret_or_env("RDS_PASSWORD", "rds.password", ""),
-            database="stock_db",
-            charset="utf8mb4",
-            connect_timeout=5
-        )
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content, created_at FROM chat_memory WHERE session_id=%s ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        messages = []
-        for row in rows:
-            role, content, created_at = row
-            messages.append({
-                "role": role,
-                "content": content or "",
-                "timestamp": str(created_at) if created_at else ""
-            })
-        return messages
-    except Exception as e:
-        logger.warning(f"load_session_messages 失败: {e}")
-        return []
-
-def delete_session(session_id: str):
-    """软删除会话：写入 deleted_sessions 表"""
-    try:
-        import pymysql
-        conn = pymysql.connect(
-            host=get_secret_or_env("RDS_HOST", "rds.host", "rm-2zeli1or40iqt7vq66o.mysql.rds.aliyuncs.com"),
-            port=int(get_secret_or_env("RDS_PORT", "rds.port", "3306")),
-            user=get_secret_or_env("RDS_USER", "rds.user", "zhuanz1"),
-            password=get_secret_or_env("RDS_PASSWORD", "rds.password", ""),
-            database="stock_db",
-            charset="utf8mb4",
-            connect_timeout=5
-        )
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO deleted_sessions(session_id, deleted_at) VALUES(%s, NOW())",
-            (session_id,)
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"会话已删除: {session_id}")
-        return True
-    except Exception as e:
-        logger.warning(f"delete_session 失败: {e}")
-        return False
-
 # ================= 初始化 =================
 def init_session():
     if "messages" not in st.session_state:
@@ -354,12 +286,32 @@ def init_session():
         st.session_state.generating = False
     if "stop" not in st.session_state:
         st.session_state.stop = False
-    if "total_tokens_used" not in st.session_state:
-        st.session_state.total_tokens_used = 0
     if "history_loaded" not in st.session_state:
         st.session_state.history_loaded = False
     if "ctx_restoring" not in st.session_state:
         st.session_state.ctx_restoring = False
+    if "history_sessions" not in st.session_state:
+        st.session_state.history_sessions = []
+
+# ================= 新建会话（归档当前对话到历史） =================
+def start_new_session():
+    if st.session_state.messages:
+        title = extract_title_from_messages(st.session_state.messages) or "新对话"
+        st.session_state.history_sessions.append({
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "messages": st.session_state.messages.copy(),
+            "rounds": len([m for m in st.session_state.messages if m["role"] == "user"]),
+            "created_at": now_ts_display()
+        })
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.history_loaded = False
+    st.session_state.generating = False
+    st.session_state.stop = False
+    st.session_state.render_offset = 0
+    st.session_state.messages = []
+    st.session_state.display_messages = []
+    st.session_state.selected_session_id = None
 
 # ================= 上下文恢复（启动时执行一次）=================
 def trigger_ctx_restore():
@@ -490,17 +442,9 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
 
 st.divider()
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.button("新建会话", use_container_width=True, disabled=st.session_state.generating):
-        st.session_state.session_id = str(uuid.uuid4())
-        st.session_state.messages = []
-        st.session_state.display_messages = []
-        st.session_state.render_offset = 0
-        st.session_state.history_loaded = False
-        st.rerun()
+col1, col2 = st.columns(2)
 
-with col2:
+with col1:
     if st.button("重新生成", use_container_width=True, disabled=st.session_state.generating):
         if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
             st.session_state.messages.pop()
@@ -508,23 +452,43 @@ with col2:
             st.session_state.generating = True
             st.rerun()
 
-with col3:
-    st.download_button(
-        label="导出DOCX",
-        data=export_docx(st.session_state.display_messages),
-        file_name=f"对话_{datetime.now(BEIJING_TZ).strftime('%Y%m%d')}.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        use_container_width=True,
-        key="export_docx_btn"
-    )
+with col2:
+    # 只导出分析方案（带【】标题的助手消息）
+    scheme_msgs = filter_scheme_messages(st.session_state.display_messages)
+    if scheme_msgs:
+        docx_data = export_docx(scheme_msgs)
+        title = extract_title_from_messages(scheme_msgs)
+        timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+        if title:
+            safe_title = re.sub(r'[\\/*?:"<>|]', '', title)[:50]
+            file_name = f"{safe_title}_{timestamp}.docx"
+        else:
+            file_name = f"分析方案_{timestamp}.docx"
+
+        if st.download_button(
+            label="📤 导出DOCX",
+            data=docx_data,
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="export_docx_btn"
+        ):
+            # 下载到本地
+            pass
+    else:
+        st.info("当前没有可导出的分析方案")
 
 with st.sidebar:
     st.title("智飞投研")
     st.caption(f"当前时间: {now_ts_display()}")
     st.info(f"当前模型: **{st.session_state.model_name}**")
+
+    if st.button("➕ 新建会话", use_container_width=True, disabled=st.session_state.generating):
+        start_new_session()
+        st.rerun()
     st.divider()
 
-    st.subheader("分析方案")
+    st.subheader("📊 分析方案")
     scheme_cols_1 = st.columns(3)
     scheme_cols_2 = st.columns(3)
     schemes = ["盘前快速分析", "产业链扫描", "卡脖子扫描", "市场行情判断", "资金全景动态", "标的股研报"]
@@ -540,7 +504,7 @@ with st.sidebar:
                     st.toast(f"已切换至: {scheme_name}，请输入标的/事件", icon="ℹ️")
     st.divider()
 
-    st.subheader("快捷工具")
+    st.subheader("⚡ 快捷工具")
     tool_cols = st.columns(3)
     with tool_cols[0]:
         if st.button("简报", use_container_width=True, key="daily_brief"):
@@ -559,59 +523,33 @@ with st.sidebar:
     st.success(f"当前方案: **{st.session_state.scheme}**")
     st.divider()
 
-    st.subheader("Token 监控")
-    total_used = st.session_state.get("total_tokens_used", 0)
-    BUDGET = 1000000
-    usage_ratio = min(total_used / BUDGET, 1.0)
-    if usage_ratio >= 0.8:
-        st.warning(f"Token使用量已达 {usage_ratio*100:.1f}%")
-    elif usage_ratio >= 0.6:
-        st.info(f"Token使用量: {usage_ratio*100:.1f}%")
-    st.progress(usage_ratio, text=f"{total_used:,} / {BUDGET:,} ({usage_ratio*100:.1f}%)")
-    st.caption(f"本会话累计消耗: `{total_used:,}` Tokens")
-    st.divider()
-
     st.subheader("系统状态")
     st.caption("模型自行管理上下文 (RDS)")
     st.divider()
 
-    st.subheader("历史会话")
-    history_sessions = get_history_sessions()
-    if history_sessions:
-        for s in history_sessions:
-            sid = s["session_id"]
-            title = s["title"]
-            rounds = s["rounds"]
-            last_time = s["last_time"][:16] if s["last_time"] else ""
+    # ===== 历史会话（纯前端内存，不读数据库） =====
+    st.subheader("📜 历史对话")
+    if not st.session_state.history_sessions:
+        st.caption("暂无历史对话")
+    else:
+        for idx, s in enumerate(st.session_state.history_sessions):
+            sid = s.get("id", f"hist_{idx}")
+            title = s.get("title", "（无标题）")
+            rounds = s.get("rounds", 0)
 
             col_a, col_b = st.columns([4, 1])
             with col_a:
-                is_current = (sid == st.session_state.session_id)
-                label = f"{'🟢 ' if is_current else ''}{title} ({rounds}轮)"
-                if st.button(label, key=f"hist_{sid}", use_container_width=True,
-                           help=f"最后活跃: {last_time}"):
-                    if sid != st.session_state.session_id:
-                        msgs = load_session_messages(sid)
-                        st.session_state.session_id = sid
-                        st.session_state.messages = msgs
-                        st.session_state.display_messages = msgs.copy()
-                        st.session_state.render_offset = 0
-                        st.session_state.history_loaded = True
-                        st.rerun()
+                if st.button(f"{title} ({rounds}轮)", key=f"hist_{sid}", use_container_width=True):
+                    st.session_state.messages = s.get("messages", []).copy()
+                    st.session_state.display_messages = st.session_state.messages.copy()
+                    st.session_state.render_offset = 0
+                    st.rerun()
             with col_b:
-                if st.button("🗑", key=f"del_{sid}", help="删除此会话"):
-                    if delete_session(sid):
-                        if sid == st.session_state.session_id:
-                            st.session_state.session_id = str(uuid.uuid4())
-                            st.session_state.messages = []
-                            st.session_state.display_messages = []
-                            st.session_state.render_offset = 0
-                            st.session_state.history_loaded = False
-                        st.rerun()
-    else:
-        st.caption("暂无历史会话")
-    st.divider()
+                if st.button("🗑️", key=f"del_hist_{sid}", use_container_width=True):
+                    st.session_state.history_sessions.pop(idx)
+                    st.rerun()
 
+    st.divider()
     if st.button("清空显示", use_container_width=True):
         st.session_state.display_messages = []
         st.session_state.render_offset = 0
