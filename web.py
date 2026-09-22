@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-智飞投研 · 云端 v3.9 (2026-09-06)
-- 导出DOCX和上传OSS合并为一个按钮（参照本地版）
-- 历史对话改用前端 session_state 管理，不从RDS查询
-- 删除Token监控
-- 保留：后加载-智能接续、每轮写入RDS、百炼session记忆
+智飞投研 · 云端 v4.0 (2026-09-22)
+- 全局配置专属域名
+- RDS列名 messages，一轮一条记录
+- 恢复指令4行纲要
+- session_id 传递 + 变化检测 + 补发恢复
+- 导出DOCX并写入OSS
 """
 
 import os
@@ -28,10 +29,12 @@ from dotenv import load_dotenv
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
+import oss2
 
 load_dotenv()
 
 _CHINESE_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
+
 
 def get_secret_or_env(key, secrets_key=None, default=None):
     if secrets_key:
@@ -46,35 +49,62 @@ def get_secret_or_env(key, secrets_key=None, default=None):
             pass
     return os.getenv(key, default)
 
+
+# ================= 全局配置 =================
 DASHSCOPE_API_KEY = get_secret_or_env("DASHSCOPE_API_KEY", "dashscope.api_key")
 if not DASHSCOPE_API_KEY:
     raise RuntimeError("请配置 DASHSCOPE_API_KEY")
 
+DASHSCOPE_BASE_URL = get_secret_or_env(
+    "DASHSCOPE_BASE_URL",
+    "dashscope.base_url",
+    "https://ws-qnv8hodqvvp30k31.cn-beijing.maas.aliyuncs.com"
+)
+
+dashscope.api_key = DASHSCOPE_API_KEY
+dashscope.base_url = DASHSCOPE_BASE_URL
+
 MODEL_NAME = get_secret_or_env("MODEL_NAME", "model.name", "deepseek-v4-pro")
 BEIJING_TZ = pytz.timezone('Asia/Shanghai')
+
+# OSS 配置
+OSS_BUCKET = get_secret_or_env("OSS_BUCKET", "oss.bucket", "zfai-date-oss")
+OSS_REGION = get_secret_or_env("OSS_REGION", "oss.region", "cn-beijing")
+OSS_PREFIX = get_secret_or_env("OSS_PREFIX", "oss.prefix", "analysis/")
+OSS_ACCESS_KEY_ID = get_secret_or_env("OSS_ACCESS_KEY_ID", "oss.access_key_id")
+OSS_ACCESS_KEY_SECRET = get_secret_or_env("OSS_ACCESS_KEY_SECRET", "oss.access_key_secret")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET:
+    logger.warning("OSS 凭证未配置，OSS 相关功能不可用")
+
+
 def now_ts_display():
     return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def is_one_click_scheme(scheme_name):
     return scheme_name in ["盘前分析", "产业扫描", "简报", "周报"]
 
+
 def get_scheme_prompt(scheme_name):
     return f"请执行【{scheme_name}】分析方案"
+
 
 # ================= 熔断机制 =================
 _FAIL_LOCK = threading.Lock()
 _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
 _MODEL_HEALTHY = True
 
+
 def reset_health_status():
     global _FAIL_COUNTER, _MODEL_HEALTHY
     with _FAIL_LOCK:
         _FAIL_COUNTER = {"network": 0, "api": 0, "model": 0}
         _MODEL_HEALTHY = True
+
 
 def mark_failure(error_type: str):
     global _FAIL_COUNTER, _MODEL_HEALTHY
@@ -86,9 +116,11 @@ def mark_failure(error_type: str):
             _MODEL_HEALTHY = False
             logger.warning("模型服务熔断")
 
+
 def is_model_healthy() -> bool:
     with _FAIL_LOCK:
         return _MODEL_HEALTHY
+
 
 def _classify_error(e: Exception) -> str:
     err_str = str(e).lower()
@@ -99,6 +131,7 @@ def _classify_error(e: Exception) -> str:
     if any(kw in err_str for kw in ["rate", "quota", "throttle", "limit", "429"]):
         return "api"
     return "model"
+
 
 # ================= 百炼调用 =================
 def _clean_for_api(raw_msgs: List[Dict]) -> List[Dict]:
@@ -114,6 +147,7 @@ def _clean_for_api(raw_msgs: List[Dict]) -> List[Dict]:
     if not valid:
         return []
     return valid
+
 
 def _extract_text_from_response(resp) -> str:
     output = resp.output
@@ -145,54 +179,100 @@ def _extract_text_from_response(resp) -> str:
             return text
     return ""
 
+
 def build_ctx_restore_instruction() -> str:
     """后加载-智能接续：新会话启动时执行一次"""
-    return """新会话启动，接上之前的内容：
+    return """【恢复指令】使用 executeQuerySql 工具操作 RDS chat_memory 表：
 
-从 chat_memory 最后取两段数据：
-- 最后5轮完整对话（做无缝对接）
-- 最后25轮对话数据（用来写摘要）
+执行以下 SQL（不要加任何 WHERE 条件，不要限制 session_id）：
+1. 查最后5轮完整对话（无缝对接）：
+   SELECT messages FROM chat_memory ORDER BY id DESC LIMIT 5
+2. 查最后25轮对话数据（自己读一遍了解脉络，不要生成摘要给用户看）：
+   SELECT messages FROM chat_memory ORDER BY id DESC LIMIT 25
 
-用那25轮写一篇500字左右的摘要，把最近聊了什么主线、涉及的标的和板块、关键结论都串起来。
+你自己读完这两批数据后，按以下格式回复（只回这4行，不要贴摘要、不要贴对话原文）：
 
-回复的时候先贴摘要，再贴最后5轮完整对话，然后正常回我消息。"""
+✅ 上文恢复成功
+📋 恢复范围：最后5轮对话 + 25轮对话数据
+🕐 恢复时间：当前时间
+📌 主要脉络：用3-5个关键词概括这25轮在聊什么，用 / 分隔
 
-def build_write_instruction(user_content: str, assistant_content: str) -> str:
-    """构造对话写入指令（每轮结束后执行）"""
-    user_escaped = json.dumps(user_content, ensure_ascii=False)
-    assistant_escaped = json.dumps(assistant_content, ensure_ascii=False)
+无数据时回复：
+⚠️ RDS暂无对话数据，本次为全新会话
+
+报错时回复：
+⚠️ 恢复失败：具体错误信息
+
+回执发完后，正常回复我的消息。"""
+
+
+def build_write_instruction(session_id: str, round_num: int, user_content: str, assistant_content: str, ts: str) -> str:
+    """构造对话写入指令：一轮一条记录，用 messages 列"""
+    record = {
+        "session_id": session_id,
+        "round_num": round_num,
+        "messages": {
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content}
+            ]
+        },
+        "ts": ts
+    }
+    json_str = json.dumps(record, ensure_ascii=False)
+    # 去掉emoji避免编码问题
+    json_str = re.sub(r'[\U00010000-\U0010ffff]', '', json_str)
+    # 转义单引号
+    json_str_escaped = json_str.replace("'", "''")
+
     return f"""[系统] 请将本轮对话原文写入 rds chat_memory：
 
-使用 executeQuerySql 工具操作 rds chat_memory 表，追加新增两条 jsonl 数据：
+使用 executeQuerySql 工具执行以下 SQL：
 
-INSERT INTO chat_memory (jsonl) VALUES ('{json.dumps({"role": "user", "content": user_escaped}, ensure_ascii=False)}');
-INSERT INTO chat_memory (jsonl) VALUES ('{json.dumps({"role": "assistant", "content": assistant_escaped}, ensure_ascii=False)}');
+INSERT INTO chat_memory (session_id, round_num, messages, ts) VALUES ('{session_id}', {round_num}, '{json_str_escaped}', '{ts}');
 
 要求：
 - 原文逐字写入，不截断
 - 追加新增，不影响已有数据"""
 
+
 def call_bailian(messages: List[Dict]) -> str:
     if not is_model_healthy():
         raise RuntimeError("服务暂时不可用")
-    dashscope.api_key = DASHSCOPE_API_KEY
+
     cleaned = _clean_for_api(messages)
     if not cleaned:
         raise RuntimeError("上下文中没有有效的用户消息")
+
     BAILIAN_APP_ID = "45db2f797bfd49229f757b04ed13ac92"
     retries, delay = 3, 2
+
+    sent_session_id = st.session_state.get("bailian_session_id")
+
     for attempt in range(retries):
         try:
             resp = Application.call(
                 app_id=BAILIAN_APP_ID,
                 messages=cleaned,
-                stream=False
+                stream=False,
+                session_id=sent_session_id
             )
             if resp.status_code == HTTPStatus.OK:
                 full_text = _extract_text_from_response(resp)
                 if not full_text or not full_text.strip():
                     raise RuntimeError("模型返回内容为空")
                 reset_health_status()
+
+                # 检测 session_id 变化
+                received_session_id = getattr(resp.output, 'session_id', None)
+                if sent_session_id and received_session_id and sent_session_id != received_session_id:
+                    st.session_state.session_changed = True
+                    logger.info(f"【会话变更】{sent_session_id[:8]} → {received_session_id[:8]}")
+
+                if received_session_id:
+                    st.session_state.bailian_session_id = received_session_id
+                    logger.info(f"百炼 session_id: {st.session_state.bailian_session_id}")
+
                 return full_text
             else:
                 raise RuntimeError(f"API Error: {resp.code} - {resp.message}")
@@ -204,12 +284,13 @@ def call_bailian(messages: List[Dict]) -> str:
             logger.warning(f"call_bailian 重试 {attempt+1}/{retries}: {e}")
             time.sleep(delay)
             delay *= 2
+
     raise RuntimeError("未知错误")
 
-# ================= 导出DOCX（含标题提取、方案过滤） =================
+
+# ================= 导出DOCX + OSS =================
 def filter_scheme_messages(messages):
-    """从对话消息中过滤出分析方案（只保留助手消息，且内容包含方案标题或关键词）"""
-    scheme_keywords = ["盘前分析", "产业扫描", "国产代替", "行情判断", "资金动态", "个股分析", "速查"]
+    scheme_keywords = ["盘前分析", "产业扫描", "国产替代", "行情判断", "资金动态", "个股分析", "速查"]
     result = []
     for m in messages:
         if m.get("role") != "assistant":
@@ -219,8 +300,8 @@ def filter_scheme_messages(messages):
             result.append(m)
     return result
 
+
 def extract_title_from_messages(messages):
-    """从对话消息中提取标题，供 OSS 文件命名使用"""
     for m in reversed(messages):
         if m.get("role") == "assistant":
             content = m.get("content", "")
@@ -238,6 +319,7 @@ def extract_title_from_messages(messages):
                     if clean_line:
                         return clean_line[:20]
     return None
+
 
 def export_docx(messages):
     doc = Document()
@@ -268,6 +350,37 @@ def export_docx(messages):
     buffer.seek(0)
     return buffer
 
+
+def get_oss_client():
+    if not OSS_ACCESS_KEY_ID or not OSS_ACCESS_KEY_SECRET:
+        raise RuntimeError("OSS 凭证未配置")
+    auth = oss2.Auth(OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET)
+    return oss2.Bucket(auth, f"oss-{OSS_REGION}.aliyuncs.com", OSS_BUCKET)
+
+
+def upload_docx_to_oss(messages, filename=None):
+    try:
+        if not filename:
+            title = extract_title_from_messages(messages)
+            timestamp = datetime.now(BEIJING_TZ).strftime("%Y%m%d_%H%M%S")
+            if title:
+                safe_title = re.sub(r'[\\/*?:"<>|]', '', title)[:50]
+                filename = f"{safe_title}_{timestamp}.docx"
+            else:
+                filename = f"对话记录_{timestamp}.docx"
+
+        docx_buffer = export_docx(messages)
+        remote_path = OSS_PREFIX + filename
+        bucket = get_oss_client()
+        docx_buffer.seek(0)
+        bucket.put_object(remote_path, docx_buffer.getvalue())
+        logger.info(f"【DOCX→OSS上传成功】{remote_path}")
+        return remote_path
+    except Exception as e:
+        logger.error(f"【DOCX→OSS上传失败】{e}")
+        raise
+
+
 # ================= 初始化 =================
 def init_session():
     if "messages" not in st.session_state:
@@ -292,8 +405,12 @@ def init_session():
         st.session_state.ctx_restoring = False
     if "history_sessions" not in st.session_state:
         st.session_state.history_sessions = []
+    if "bailian_session_id" not in st.session_state:
+        st.session_state.bailian_session_id = None
+    if "session_changed" not in st.session_state:
+        st.session_state.session_changed = False
 
-# ================= 新建会话（归档当前对话到历史） =================
+
 def start_new_session():
     if st.session_state.messages:
         title = extract_title_from_messages(st.session_state.messages) or "新对话"
@@ -304,6 +421,7 @@ def start_new_session():
             "rounds": len([m for m in st.session_state.messages if m["role"] == "user"]),
             "created_at": now_ts_display()
         })
+    st.session_state.bailian_session_id = None
     st.session_state.session_id = str(uuid.uuid4())
     st.session_state.history_loaded = False
     st.session_state.generating = False
@@ -312,8 +430,9 @@ def start_new_session():
     st.session_state.messages = []
     st.session_state.display_messages = []
     st.session_state.selected_session_id = None
+    st.session_state.session_changed = False
 
-# ================= 上下文恢复（启动时执行一次）=================
+
 def trigger_ctx_restore():
     if st.session_state.history_loaded:
         return
@@ -347,6 +466,7 @@ def trigger_ctx_restore():
     st.session_state.history_loaded = True
     st.session_state.ctx_restoring = False
     st.session_state.generating = False
+
 
 # ================= UI =================
 st.set_page_config(page_title="智飞投研·云端", layout="centered")
@@ -389,6 +509,7 @@ if _pending_prompt and not st.session_state.generating:
 
 if user_input and not st.session_state.generating:
     st.session_state.generating = True
+    round_num = len([m for m in st.session_state.messages if m["role"] == "user"]) + 1
     user_msg = {
         "role": "user",
         "content": user_input,
@@ -400,6 +521,7 @@ if user_input and not st.session_state.generating:
 
 if st.session_state.generating and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     if not st.session_state.ctx_restoring:
+        round_num = len([m for m in st.session_state.messages if m["role"] == "user"])
         user_msg = st.session_state.messages[-1]
         user_content = str(user_msg.get("content") or "")
 
@@ -409,6 +531,15 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             with st.spinner("思考中..."):
                 reply = call_bailian(ctx)
 
+            # 检测到 session_id 变化，补发恢复指令
+            if st.session_state.get("session_changed"):
+                logger.info("【会话恢复】检测到 session_id 变化，补发恢复指令")
+                restore_cmd = build_ctx_restore_instruction()
+                retry_content = f"{restore_cmd}\n\n---\n\n用户消息：{user_content}"
+                retry_ctx = [{"role": "user", "content": retry_content}]
+                reply = call_bailian(retry_ctx)
+                st.session_state.session_changed = False
+
             assistant_msg = {
                 "role": "assistant",
                 "content": reply,
@@ -417,7 +548,11 @@ if st.session_state.generating and st.session_state.messages and st.session_stat
             st.session_state.messages.append(assistant_msg)
             st.session_state.display_messages.append(assistant_msg)
 
-            write_instruction = build_write_instruction(user_content, reply)
+            # 构造写入指令，让模型写入 RDS
+            ts_str = now_ts_display()
+            write_instruction = build_write_instruction(
+                st.session_state.session_id, round_num, user_content, reply, ts_str
+            )
             write_ctx = [
                 {"role": "system", "content": "你是智飞投研助手，执行 SQL 写入操作。"},
                 {"role": "user", "content": write_instruction}
@@ -453,7 +588,6 @@ with col1:
             st.rerun()
 
 with col2:
-    # 只导出分析方案（带【】标题的助手消息）
     scheme_msgs = filter_scheme_messages(st.session_state.display_messages)
     if scheme_msgs:
         docx_data = export_docx(scheme_msgs)
@@ -466,15 +600,18 @@ with col2:
             file_name = f"分析方案_{timestamp}.docx"
 
         if st.download_button(
-            label="📤 导出DOCX",
+            label="📤 导出DOCX并写入OSS",
             data=docx_data,
             file_name=file_name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
             key="export_docx_btn"
         ):
-            # 下载到本地
-            pass
+            try:
+                path = upload_docx_to_oss(scheme_msgs, file_name)
+                st.toast(f"✅ 已上传到 OSS: {path}", icon="📤")
+            except Exception as e:
+                st.toast(f"❌ 上传失败: {e}", icon="❌")
     else:
         st.info("当前没有可导出的分析方案")
 
@@ -525,9 +662,10 @@ with st.sidebar:
 
     st.subheader("系统状态")
     st.caption("模型自行管理上下文 (RDS)")
+    st.caption(f"百炼 session_id: {st.session_state.get('bailian_session_id', '未初始化')[:8] if st.session_state.get('bailian_session_id') else '未初始化'}")
     st.divider()
 
-    # ===== 历史会话（纯前端内存，不读数据库） =====
+    # ===== 历史对话（纯前端内存） =====
     st.subheader("📜 历史对话")
     if not st.session_state.history_sessions:
         st.caption("暂无历史对话")
